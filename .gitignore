@@ -1,0 +1,8 @@
+__pycache__/
+*.egg-info/
+.venv/
+dist/
+build/
+.env
+samples/.env
+tests/msgraph_test_token.json
