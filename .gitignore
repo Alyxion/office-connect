@@ -4,5 +4,4 @@ __pycache__/
 dist/
 build/
 .env
-samples/.env
 tests/msgraph_test_token.json
