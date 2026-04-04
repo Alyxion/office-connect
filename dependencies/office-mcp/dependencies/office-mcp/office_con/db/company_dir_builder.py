@@ -1,4 +1,3 @@
-import asyncio
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 import json
@@ -133,8 +132,7 @@ class CompanyDirBuilder:
                 self.logger.error(f"Error applying replacements: {e}")
             raise
 
-    def _guess_genders_sync(self) -> None:
-        """CPU-heavy gender guessing — runs in a thread to avoid blocking the event loop."""
+    async def guess_genders(self):
         from names_dataset import NameDataset, NameWrapper
         nd = NameDataset()
         for user in self.user_list.users:
@@ -170,9 +168,6 @@ class CompanyDirBuilder:
                             user.gender = "male"
                         elif gender.startswith("Female"):
                             user.gender = "female"
-
-    async def guess_genders(self):
-        await asyncio.to_thread(self._guess_genders_sync)
                 
     async def build(self, *args: object, **kwargs: object) -> None:
         """

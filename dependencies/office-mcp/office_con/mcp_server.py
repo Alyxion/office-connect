@@ -75,8 +75,8 @@ def export_keyfile(
 
 async def _create_graph(keyfile: str) -> MsGraphInstance:
     """Create an authenticated MsGraphInstance from a key file."""
-    from pathlib import Path as _Path
-    data = await asyncio.to_thread(lambda: json.loads(_Path(keyfile).read_text()))
+    with open(keyfile) as f:
+        data = json.load(f)
 
     inst = MsGraphInstance(
         scopes=None,
