@@ -108,7 +108,13 @@ class WebUserInstance:
         return self._mongodb_client_async
 
     def _derive_encryption_key(self, client_id: str) -> bytes:
-        """Derive an encryption key from the client_id."""
+        """Derive an encryption key from the client_id.
+
+        Note: PBKDF2 with 100K iterations is CPU-heavy (~10-50ms) and technically
+        blocks the event loop when called from async context. This is acceptable
+        because the result is cached in ``_encryption_key`` after first derivation,
+        so the blocking cost is paid only once per session.
+        """
         # Use PBKDF2 to derive a key from the client_id
         salt = self._salt.encode()  # A fixed salt
         kdf = PBKDF2HMAC(
