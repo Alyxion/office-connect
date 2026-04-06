@@ -7,7 +7,7 @@ import unicodedata
 from collections import Counter
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
-from typing import Any, Dict, List, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from office_con.msgraph.directory_handler import DirectoryUser
 from .mcp_base import MsGraphMCPServer
