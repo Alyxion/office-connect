@@ -108,7 +108,13 @@ class WebUserInstance:
         return self._mongodb_client_async
 
     def _derive_encryption_key(self, client_id: str) -> bytes:
-        """Derive an encryption key from the client_id."""
+        """Derive an encryption key from the client_id.
+
+        Note: PBKDF2 with 100K iterations is CPU-heavy (~10-50ms) and technically
+        blocks the event loop when called from async context. This is acceptable
+        because the result is cached in ``_encryption_key`` after first derivation,
+        so the blocking cost is paid only once per session.
+        """
         # Use PBKDF2 to derive a key from the client_id
         salt = self._salt.encode()  # A fixed salt
         kdf = PBKDF2HMAC(
@@ -284,29 +290,21 @@ class WebUserInstance:
         # First try memory cache
         with self.access_lock:
             if self.cache_dict.get("refresh_token", None) is not None:
-                _log.info("[AUTH] get_refresh_token_async — found in memory cache")
                 return self.cache_dict["refresh_token"]
         # Then try Redis if available
-        redis_client = await self.redis_client_async()
-        if not redis_client:
-            _log.warning("[AUTH] get_refresh_token_async — no redis client (url=%s)", bool(self._redis_url))
+        if not (redis_client := await self.redis_client_async()) or not self.user_path:
+            _log.warning("[AUTH] get_refresh_token_async — no redis or no user_path")
             return None
-        if not self.user_path:
-            _log.warning("[AUTH] get_refresh_token_async — no user_path (session_id=%s)", self.session_id[:8] if self.session_id else "None")
-            return None
-        redis_key = self.user_path + REFRESH_TOKEN_ID
         try:
-            encrypted_token = await redis_client.get(redis_key)
+            encrypted_token = await redis_client.get(self.user_path + REFRESH_TOKEN_ID)
             if encrypted_token is not None:
+                # Decrypt the token
                 decrypted = self._decrypt(encrypted_token)
                 if not decrypted:
-                    _log.warning("[AUTH] get_refresh_token_async — decryption failed (key=%s, session=%s, data_len=%d)",
-                                 redis_key, self.session_id[:8] if self.session_id else "?", len(encrypted_token))
-                    return None
-                _log.info("[AUTH] get_refresh_token_async — found in Redis (key=%s)", redis_key)
-                return decrypted
+                    _log.warning("[AUTH] get_refresh_token_async — decryption returned empty")
+                return decrypted or None
             else:
-                _log.warning("[AUTH] get_refresh_token_async — key not found in Redis (key=%s)", redis_key)
+                _log.warning("[AUTH] get_refresh_token_async — no refresh token in Redis")
         except Exception as e:
             _log.warning("[AUTH] get_refresh_token_async — Redis error: %s", e)
             return None

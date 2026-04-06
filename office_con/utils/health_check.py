@@ -1,3 +1,4 @@
+import asyncio
 import os
 import signal
 import threading
@@ -279,8 +280,9 @@ async def health_endpoint() -> JSONResponse:
     this endpoint won't respond, and the self-check thread will detect the timeout."""
     try:
         # Run a fresh DB check inline (tests shared connections from event loop context)
+        # Offload blocking sync Redis/MongoDB pings to a thread so we don't block the event loop
         for name, config in db_configs.items():
-            status = check_database_health(config)
+            status = await asyncio.to_thread(check_database_health, config)
             db_health_status[name] = status.model_dump()
 
         result = await health_check()
