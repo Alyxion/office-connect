@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json as _json
 import logging
-import re
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse, parse_qs
 
@@ -57,11 +56,6 @@ def _extract_path(url: str) -> str:
     return path.lstrip("/")
 
 
-def _uid() -> str:
-    import uuid
-    return str(uuid.uuid4())
-
-
 class MockGraphTransport:
     """Intercepts MS Graph HTTP calls and returns synthetic responses."""
 
@@ -82,10 +76,6 @@ class MockGraphTransport:
         if path == "me/photo/$value" or path.startswith("me/photo"):
             return self._photo_response()
 
-        # ── /me/calendars/{id}/events (POST) ─────────────────
-        if re.match(r"me/calendars/[^/]+/events$", path) and method == "POST":
-            return self._create_event_response(json_body)
-
         # ── /me/calendars ────────────────────────────────────
         if path == "me/calendars":
             return self._calendars_response()
@@ -97,10 +87,6 @@ class MockGraphTransport:
         # ── /me/calendar/getSchedule ─────────────────────────
         if path == "me/calendar/getSchedule":
             return self._schedule_response(json_body)
-
-        # ── /me/outlook/masterCategories ─────────────────────
-        if path == "me/outlook/masterCategories":
-            return self._categories_response()
 
         # ── /me/mailboxSettings ──────────────────────────────
         if path == "me/mailboxSettings":
@@ -117,24 +103,6 @@ class MockGraphTransport:
         # ── /me/sendMail ─────────────────────────────────────
         if path == "me/sendMail":
             return _make_response(202, {})
-
-        # ── /me/joinedTeams ──────────────────────────────────
-        if path == "me/joinedTeams":
-            return self._joined_teams_response()
-
-        # ── /teams/{id}/channels ─────────────────────────────
-        if re.match(r"teams/[^/]+/channels$", path):
-            team_id = path.split("/")[1]
-            return self._team_channels_response(team_id)
-
-        # ── /teams/{id}/members ──────────────────────────────
-        if re.match(r"teams/[^/]+/members$", path):
-            team_id = path.split("/")[1]
-            return self._team_members_response(team_id)
-
-        # ── /me/chats ────────────────────────────────────────
-        if path == "me/chats":
-            return self._chats_response()
 
         # ── /users/* ─────────────────────────────────────────
         if path.startswith("users/") or path == "users":
@@ -182,12 +150,6 @@ class MockGraphTransport:
     def _calendar_events_response(self, url: str) -> _MockResponse:
         return _make_response(200, {"value": self._profile.calendar_events})
 
-    def _create_event_response(self, json_body: dict | None) -> _MockResponse:
-        event = dict(json_body or {})
-        event.setdefault("id", _uid())
-        event.setdefault("webLink", "https://outlook.office.com/calendar/mock/" + event["id"])
-        return _make_response(201, event)
-
     def _schedule_response(self, json_body: dict | None) -> _MockResponse:
         emails = (json_body or {}).get("schedules", [])
         schedules = []
@@ -205,19 +167,6 @@ class MockGraphTransport:
             })
         return _make_response(200, {"value": schedules})
 
-    # ── Categories ───────────────────────────────────────────
-
-    def _categories_response(self) -> _MockResponse:
-        categories = [
-            {"displayName": "Red Category", "color": "preset0"},
-            {"displayName": "Orange Category", "color": "preset1"},
-            {"displayName": "Yellow Category", "color": "preset2"},
-            {"displayName": "Green Category", "color": "preset3"},
-            {"displayName": "Blue Category", "color": "preset4"},
-            {"displayName": "Purple Category", "color": "preset5"},
-        ]
-        return _make_response(200, {"value": categories})
-
     # ── Mail ─────────────────────────────────────────────────
 
     def _mailbox_settings_response(self) -> _MockResponse:
@@ -229,66 +178,17 @@ class MockGraphTransport:
 
     def _mail_folder_response(self, path: str, method: str,
                               json_body: dict | None, qs: dict) -> _MockResponse:
-        # Parse folder ID from path: me/mailFolders/{folder_id}/...
-        # parts: ["me", "mailFolders", "{folder_id}", "messages"|"childFolders"]
-        parts = path.split("/")
-        folder_id = parts[2] if len(parts) > 2 else None
-
-        # GET me/mailFolders/{folder_id}/childFolders
-        if len(parts) >= 4 and parts[3] == "childFolders" and method == "GET":
-            child_folders = [
-                f for f in self._profile.mail_folders
-                if f.get("parentFolderId") == folder_id
-            ]
-            return _make_response(200, {"value": child_folders})
-
-        # GET me/mailFolders/{folder_id}/messages
+        # GET .../mailFolders/inbox/messages
         if "messages" in path and method == "GET":
-            # Filter messages by _folder_id
-            if folder_id:
-                messages = [
-                    m for m in self._profile.mail_messages
-                    if m.get("_folder_id") == folder_id
-                ]
-            else:
-                messages = self._profile.mail_messages
-
-            total = len(messages)
-            top = int(qs.get("$top", [str(total)])[0])
+            messages = self._profile.mail_messages
+            top = int(qs.get("$top", [str(len(messages))])[0])
             skip = int(qs.get("$skip", ["0"])[0])
             page = messages[skip:skip + top]
-
-            result: dict = {"value": page}
-            # Include count if requested
-            if "$count" in qs and qs["$count"][0].lower() == "true":
-                result["@odata.count"] = total
-            else:
-                result["@odata.count"] = total
-
-            return _make_response(200, result)
-
-        # GET me/mailFolders (list all folders)
-        if path == "me/mailFolders" and method == "GET":
-            return _make_response(200, {"value": self._profile.mail_folders})
-
-        # GET me/mailFolders/{folder_id} (single folder info)
-        if folder_id and method == "GET":
-            for f in self._profile.mail_folders:
-                if f.get("id") == folder_id:
-                    return _make_response(200, f)
-            # Fallback for legacy behaviour
-            folder_messages = [
-                m for m in self._profile.mail_messages
-                if m.get("_folder_id") == folder_id
-            ]
             return _make_response(200, {
-                "id": folder_id,
-                "displayName": folder_id.capitalize(),
-                "totalItemCount": len(folder_messages),
-                "unreadItemCount": sum(1 for m in folder_messages if not m.get("isRead")),
+                "value": page,
+                "@odata.count": len(messages),
             })
-
-        # Fallback: folder info for inbox
+        # Folder info
         return _make_response(200, {
             "id": "mock-inbox-id",
             "displayName": "Inbox",
@@ -298,89 +198,18 @@ class MockGraphTransport:
 
     def _messages_response(self, path: str, method: str,
                            json_body: dict | None) -> _MockResponse:
-        # POST me/messages/{id}/reply
-        if method == "POST" and path.endswith("/reply"):
-            return _make_response(202, {})
-        # POST me/messages/{id}/replyAll
-        if method == "POST" and path.endswith("/replyAll"):
-            return _make_response(202, {})
-        # POST me/messages/{id}/send
-        if method == "POST" and path.endswith("/send"):
-            return _make_response(202, {})
         if method == "PATCH":
             # Mark read, set categories, etc.
             return _make_response(200, json_body or {})
         if method == "POST":
-            # Create draft
-            draft = dict(json_body or {})
-            draft.setdefault("id", _uid())
-            draft.setdefault("webLink", "https://outlook.office.com/mock")
-            return _make_response(201, draft)
-        # GET single message by ID — extract ID from path like me/messages/{id}
-        parts = path.rstrip("/").split("/")
-        msg_id = parts[-1] if len(parts) >= 2 else ""
-        for msg in self._profile.mail_messages:
-            if msg.get("id") == msg_id:
-                return _make_response(200, msg)
-        # Fallback: return first message
+            return _make_response(201, {"id": "mock-draft-id", "webLink": "https://outlook.office.com/mock"})
+        # GET single message
         return _make_response(200, self._profile.mail_messages[0] if self._profile.mail_messages else {})
-
-    # ── Teams ────────────────────────────────────────────────
-
-    def _joined_teams_response(self) -> _MockResponse:
-        return _make_response(200, {"value": self._profile.teams})
-
-    def _team_channels_response(self, team_id: str) -> _MockResponse:
-        channels = [
-            {
-                "id": f"{team_id}-general",
-                "displayName": "General",
-                "description": "General discussion",
-                "membershipType": "standard",
-            },
-            {
-                "id": f"{team_id}-random",
-                "displayName": "Random",
-                "description": "Off-topic chat",
-                "membershipType": "standard",
-            },
-        ]
-        return _make_response(200, {"value": channels})
-
-    def _team_members_response(self, team_id: str) -> _MockResponse:
-        # Return a subset of directory users as team members
-        members = []
-        for user in self._profile.directory_users[:5]:
-            members.append({
-                "id": _uid(),
-                "displayName": user.get("displayName", ""),
-                "email": user.get("mail", ""),
-                "roles": [],
-                "@odata.type": "#microsoft.graph.aadUserConversationMember",
-            })
-        return _make_response(200, {"value": members})
-
-    # ── Chats ────────────────────────────────────────────────
-
-    def _chats_response(self) -> _MockResponse:
-        return _make_response(200, {"value": self._profile.chats})
 
     # ── Directory ────────────────────────────────────────────
 
     def _directory_response(self, path: str, qs: dict) -> _MockResponse:
         # /users/{id}/photo/$value
-        if "photo/$value" in path:
-            # Extract user ID from path
-            parts = path.split("/")
-            if len(parts) >= 2:
-                user_id = parts[1]
-                photo_bytes = self._profile.user_photos.get(user_id)
-                if photo_bytes:
-                    resp = _make_response(200, photo_bytes)
-                    resp.headers["Content-Type"] = "image/svg+xml"
-                    return resp
-            return _make_response(404, {"error": {"code": "ImageNotFound"}})
-        # /users/{id}/photo (metadata, not $value)
         if "photo" in path:
             return _make_response(404, {"error": {"code": "ImageNotFound"}})
         # /users?$top=...

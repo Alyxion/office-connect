@@ -88,7 +88,9 @@ class MsGraphInstance(WebUserInstance):
         _elapsed = (_time.monotonic() - _t0) * 1000
         if "error" in result:
             logger.warning("[OP] token_refresh — failed (%.0fms, pid=%d): %s", _elapsed, _pid, result.get("error_description", result["error"]))
-            await self.set_access_token_async(None)
+            # Keep the expired access token in Redis — deleting it would prevent
+            # the next page load from even attempting a refresh (the factory checks
+            # for access_token presence before trying refresh_token_async).
             return None
         logger.info("[OP] token_refresh — done (%.0fms, pid=%d)", _elapsed, _pid)
         await self.set_access_token_async(result["access_token"])
