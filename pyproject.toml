@@ -1,13 +1,13 @@
 [tool.poetry]
 name = "office-connect"
-version = "0.1.0"
+version = "0.1.1"
 description = "Office 365 / MS Graph logic layer with MCP server support"
 authors = ["Michael Ikemann"]
 license = "MIT"
 packages = [{include = "office_con"}]
 
 [tool.poetry.dependencies]
-python = ">=3.14,<4"
+python = ">=3.14"
 O365 = ">2.0.26"
 pydantic = ">2.5.3"
 python-dotenv = ">1.0.0"
