@@ -1719,7 +1719,7 @@ def default_mock_profile() -> MockUserProfile:
             given = user.get("givenName", "?")
             surname = user.get("surname", "?")
             initials = f"{given[0]}{surname[0]}".upper()
-            color = _AVATAR_COLORS[male_idx + female_idx % len(_AVATAR_COLORS)]
+            color = _AVATAR_COLORS[(male_idx + female_idx) % len(_AVATAR_COLORS)]
             user_photos[user["id"]] = generate_avatar_svg(initials, color)
 
     # Default teams

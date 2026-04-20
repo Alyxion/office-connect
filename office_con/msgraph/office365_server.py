@@ -5,7 +5,8 @@ import logging
 import re
 import unicodedata
 from collections import Counter
-from datetime import datetime, timedelta
+import json
+from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from typing import Any, Dict, List, Tuple, TYPE_CHECKING
 
@@ -1080,6 +1081,45 @@ registry.registerInline(async function(container) {
                     "required": ["email"],
                 },
             },
+            # ── Rooms ────────────────────────────────────────────
+            {
+                "name": "o365_list_rooms",
+                "displayName": "Meeting Rooms",
+                "icon": "meeting_room",
+                "description": (
+                    "List available meeting rooms with capacity and location.\n"
+                    "Use the room name with o365_get_room_availability to check bookings."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "filter": {"type": "string", "description": "Filter rooms by name (optional)"},
+                    },
+                    "required": [],
+                },
+            },
+            {
+                "name": "o365_get_room_availability",
+                "displayName": "Room Availability",
+                "icon": "event_available",
+                "description": (
+                    "Check when meeting rooms are free or busy today (or a given date).\n"
+                    "Pass room names (or substrings) from o365_list_rooms.\n"
+                    "Returns time slots with free/busy status in the user's timezone."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "rooms": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Room names or name substrings to check",
+                        },
+                        "date": {"type": "string", "description": "Date YYYY-MM-DD (default: today)"},
+                    },
+                    "required": ["rooms"],
+                },
+            },
         ]
 
     async def call_tool(self, name: str, arguments: Dict[str, Any]) -> str:
@@ -1091,8 +1131,172 @@ registry.registerInline(async function(container) {
             return await self._call_find_free_slots(arguments)
         elif name == "o365_org_chart":
             return await self._call_org_chart(arguments)
+        elif name == "o365_list_rooms":
+            return await self._call_list_rooms(arguments)
+        elif name == "o365_get_room_availability":
+            return await self._call_room_availability(arguments)
         else:
             return f"Unknown tool: {name}"
+
+    # ------------------------------------------------------------------
+    # o365_list_rooms
+    # ------------------------------------------------------------------
+
+    def _filter_rooms(self, rooms: list) -> list:
+        """Apply domain and exclude filters from instance config."""
+        if self.room_domain_filter:
+            rooms = [r for r in rooms
+                     if r.get("emailAddress", "").lower().endswith(self.room_domain_filter.lower())]
+        if self.room_exclude_patterns:
+            excl = [p.lower() for p in self.room_exclude_patterns]
+            rooms = [r for r in rooms
+                     if not any(ex in r.get("displayName", "").lower() for ex in excl)]
+        return rooms
+
+    async def _call_list_rooms(self, arguments: Dict[str, Any]) -> str:
+        from office_con.msgraph.places_handler import PlacesHandler
+        ph = PlacesHandler(self.graph)
+        rooms = self._filter_rooms(await ph.get_rooms_async())
+        name_filter = arguments.get("filter", "").lower()
+        if name_filter:
+            rooms = [r for r in rooms if name_filter in r.get("displayName", "").lower()]
+        result = [
+            {
+                "name": r.get("displayName", ""),
+                "capacity": r.get("capacity"),
+                "building": r.get("building"),
+                "floor": r.get("floorNumber"),
+            }
+            for r in rooms
+        ]
+        return json.dumps(result, default=str, indent=2)
+
+    # ------------------------------------------------------------------
+    # o365_get_room_availability
+    # ------------------------------------------------------------------
+
+    async def _call_room_availability(self, arguments: Dict[str, Any]) -> str:
+        from office_con.msgraph.places_handler import PlacesHandler
+        from office_con.msgraph.mailbox_settings_handler import MailboxSettingsHandler
+        from zoneinfo import ZoneInfo
+
+        _WIN_TZ = {
+            "W. Europe Standard Time": "Europe/Berlin",
+            "Central European Standard Time": "Europe/Berlin",
+            "Romance Standard Time": "Europe/Paris",
+            "GMT Standard Time": "Europe/London",
+            "Eastern Standard Time": "America/New_York",
+            "Central Standard Time": "America/Chicago",
+            "Pacific Standard Time": "America/Los_Angeles",
+            "China Standard Time": "Asia/Shanghai",
+            "India Standard Time": "Asia/Kolkata",
+        }
+
+        # User timezone
+        mbs = MailboxSettingsHandler(self.graph)
+        settings = await mbs.get_mailbox_settings_async()
+        win_tz = settings.get("timeZone", "W. Europe Standard Time")
+        iana_tz = _WIN_TZ.get(win_tz, win_tz)
+        local_tz = ZoneInfo(iana_tz)
+
+        # Date
+        date_str = arguments.get("date", "")
+        if date_str:
+            target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        else:
+            target_date = datetime.now(local_tz).date()
+
+        # Match rooms (apply domain/exclude filters)
+        ph = PlacesHandler(self.graph)
+        all_rooms = self._filter_rooms(await ph.get_rooms_async())
+        queries = arguments.get("rooms", [])
+        matched = []
+        for q in queries:
+            q_lower = q.lower()
+            for r in all_rooms:
+                if q_lower in r.get("displayName", "").lower() and r not in matched:
+                    matched.append(r)
+
+        if not matched:
+            return json.dumps({"error": "No matching rooms found"})
+
+        # Schedule query
+        emails = [r["emailAddress"] for r in matched]
+        body = {
+            "schedules": emails,
+            "startTime": {"dateTime": f"{target_date.isoformat()}T07:00:00", "timeZone": win_tz},
+            "endTime": {"dateTime": f"{target_date.isoformat()}T20:00:00", "timeZone": win_tz},
+            "availabilityViewInterval": 30,
+        }
+        token = await self.graph.get_access_token_async()
+        resp = await self.graph.run_async(
+            url=self.graph.msg_endpoint + "me/calendar/getSchedule",
+            method="POST", json=body, token=token,
+        )
+        schedules = resp.json().get("value", [])
+        email_to_name = {r["emailAddress"].lower(): r["displayName"] for r in matched}
+
+        result = []
+        for sched in schedules:
+            email = sched.get("scheduleId", "").lower()
+            room_name = email_to_name.get(email, email)
+            bookings = []
+            for item in sched.get("scheduleItems", []):
+                s = item.get("start", {}).get("dateTime", "")
+                e = item.get("end", {}).get("dateTime", "")
+                if s and e:
+                    st = datetime.fromisoformat(s.rstrip("Z")).replace(
+                        tzinfo=timezone.utc).astimezone(local_tz)
+                    en = datetime.fromisoformat(e.rstrip("Z")).replace(
+                        tzinfo=timezone.utc).astimezone(local_tz)
+                    booking = {
+                        "start": st.strftime("%H:%M"),
+                        "end": en.strftime("%H:%M"),
+                        "status": item.get("status", "busy"),
+                    }
+                    if self.show_room_booking_names:
+                        booking["subject"] = item.get("subject", "")
+                    bookings.append(booking)
+
+            free = self._compute_free(bookings)
+            result.append({
+                "room": room_name,
+                "date": target_date.isoformat(),
+                "timezone": iana_tz,
+                "bookings": bookings,
+                "free_slots": free,
+            })
+        return json.dumps(result, default=str, indent=2)
+
+    @staticmethod
+    def _compute_free(bookings: List[Dict]) -> List[Dict]:
+        """Compute merged free slots between 07:00-20:00."""
+        busy = set()
+        for b in bookings:
+            sh, sm = map(int, b["start"].split(":"))
+            eh, em = map(int, b["end"].split(":"))
+            t = sh * 60 + sm
+            end = eh * 60 + em
+            while t < end:
+                busy.add(t)
+                t += 30
+        free = []
+        t = 7 * 60
+        while t < 20 * 60:
+            if t not in busy:
+                h, m = divmod(t, 60)
+                nh, nm = divmod(t + 30, 60)
+                free.append({"start": f"{h:02d}:{m:02d}", "end": f"{nh:02d}:{nm:02d}"})
+            t += 30
+        if not free:
+            return []
+        merged = [free[0].copy()]
+        for slot in free[1:]:
+            if merged[-1]["end"] == slot["start"]:
+                merged[-1]["end"] = slot["end"]
+            else:
+                merged.append(slot.copy())
+        return merged
 
     # ------------------------------------------------------------------
     # o365_calendar_get_events (existing logic, extracted)

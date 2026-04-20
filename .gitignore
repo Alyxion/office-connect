@@ -5,3 +5,4 @@ dist/
 build/
 .env
 tests/msgraph_test_token.json
+tests/test_config.json

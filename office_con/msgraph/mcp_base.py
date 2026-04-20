@@ -43,3 +43,6 @@ class MsGraphMCPServer(InProcessMCPServer):
 
     def __init__(self, graph: "MsGraphInstance"):
         self.graph = graph
+        self.show_room_booking_names: bool = False
+        self.room_exclude_patterns: list[str] = []
+        self.room_domain_filter: str = ""

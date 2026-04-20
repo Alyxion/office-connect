@@ -38,9 +38,9 @@ class WebUserInstance:
         self._redis_url = redis_url
         self._mongodb_url: str | None = mongodb_url
         self._mongodb_client_async = None
-        self.redis_path = f"{self.app}:token_cache_v2:"
+        self.redis_path = f"{self.app}:token_cache_v3:"
         self.user_path: str | None = None
-        self.redis_lifetime = 7 * 24 * 60 * 60  # 7 days
+        self.redis_lifetime = 30 * 24 * 60 * 60  # 30 days — matches identity cookie max_age
         self.session_id = session_id
         self.cache_dict = cache_dict if cache_dict is not None else {}
         self.min_expiry = 15 * 60  # 15 minutes
@@ -190,50 +190,77 @@ class WebUserInstance:
             "surname": self.surname,
             "full_name": self.full_name,
         }
-        me = getattr(self, "me", None)
-        if me and hasattr(me, "business_phones"):
-            data["business_phones"] = me.business_phones or []
-            data["mail"] = me.mail
-            data["user_principal_name"] = getattr(me, "user_principal_name", "")
+        if self.me:
+            data["mail"] = self.me.mail
+            data["user_principal_name"] = self.me.user_principal_name or ""
         try:
             await redis_client.set(self.user_path + self.PROFILE_CACHE_ID, _json.dumps(data), ex=self.redis_lifetime)
         except Exception:
             pass
 
+    async def get_profile_async(self):
+        """Fetch user profile from MS Graph. Overridden in MsGraphInstance."""
+        pass
+
     async def restore_profile_from_redis_async(self) -> bool:
-        """Restore cached profile fields from Redis. Returns True if restored."""
+        """Restore cached profile fields from Redis.
+
+        Falls back to token refresh + MS Graph /me if the Redis cache is
+        empty or unavailable. This prevents transient Redis failures from
+        invalidating a perfectly valid user session.
+
+        Returns True if the profile was restored (email is set).
+        """
         import logging as _logging
         _log = _logging.getLogger(__name__)
         if self.email:
             return True
-        if not (redis_client := await self.redis_client_async()) or not self.user_path:
-            _log.info("[AUTH] restore_profile — no redis or no user_path")
-            return False
-        try:
-            import json as _json
-            data = await redis_client.get(self.user_path + self.PROFILE_CACHE_ID)
-            if data:
-                profile = _json.loads(data)
-                self.email = profile.get("email")
-                self.user_id = profile.get("user_id")
-                self.given_name = profile.get("given_name", "Anonymous")
-                self.surname = profile.get("surname")
-                self.full_name = profile.get("full_name")
-                if hasattr(self, "me") and self.user_id:
-                    from office_con.msgraph.profile_handler import UserProfile
-                    self.me = UserProfile(
-                        id=self.user_id,
-                        mail=profile.get("mail", self.email),
-                        givenName=self.given_name,
-                        surname=self.surname or "",
-                        displayName=self.full_name or self.given_name or "",
-                        businessPhones=profile.get("business_phones", []),
-                        userPrincipalName=profile.get("user_principal_name", self.email or ""),
-                    )
-                return bool(self.email)
-        except Exception:
-            pass
-        return False
+
+        # 1. Try Redis cache
+        redis_client = await self.redis_client_async()
+        if redis_client and self.user_path:
+            try:
+                import json as _json
+                data = await redis_client.get(self.user_path + self.PROFILE_CACHE_ID)
+                if data:
+                    profile = _json.loads(data)
+                    self.email = profile.get("email")
+                    self.user_id = profile.get("user_id")
+                    self.given_name = profile.get("given_name", "Anonymous")
+                    self.surname = profile.get("surname")
+                    self.full_name = profile.get("full_name")
+                    if self.user_id:
+                        from office_con.msgraph.profile_handler import UserProfile
+                        self.me = UserProfile(
+                            id=self.user_id,
+                            mail=profile.get("mail", self.email),
+                            givenName=self.given_name,
+                            surname=self.surname or "",
+                            displayName=self.full_name or self.given_name or "",
+                            userPrincipalName=profile.get("user_principal_name", self.email or ""),
+                        )
+                    if self.email:
+                        return True
+            except Exception as _e:
+                _log.warning("[AUTH] restore_profile — Redis read failed: %s", _e)
+
+        # 2. Fallback: try access token, then refresh token + /me
+        if not self.email:
+            try:
+                access_token = await self.get_access_token_async()
+                if not access_token:
+                    access_token = await self.refresh_token_async()
+                if access_token:
+                    await self.get_profile_async()
+                    if self.email:
+                        await self.cache_profile_to_redis_async()
+                        _log.info("[AUTH] restore_profile — recovered via token refresh")
+            except Exception as _e:
+                _log.warning("[AUTH] restore_profile — token refresh fallback failed: %s", _e)
+
+        if not self.email:
+            _log.info("[AUTH] restore_profile — all attempts failed")
+        return bool(self.email)
 
     async def get_access_token_async(self):
         import logging as _logging

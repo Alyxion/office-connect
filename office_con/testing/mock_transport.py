@@ -102,7 +102,11 @@ class MockGraphTransport:
         if path == "me/outlook/masterCategories":
             return self._categories_response()
 
-        # ── /me/mailboxSettings ──────────────────────────────
+        # ── /me/mailboxSettings (and sub-paths) ──────────────
+        if path == "me/mailboxSettings/automaticRepliesSetting":
+            return self._automatic_replies_response()
+        if path == "me/mailboxSettings/workingHours":
+            return self._working_hours_response()
         if path == "me/mailboxSettings":
             return self._mailbox_settings_response()
 
@@ -135,6 +139,50 @@ class MockGraphTransport:
         # ── /me/chats ────────────────────────────────────────
         if path == "me/chats":
             return self._chats_response()
+
+        # ── /me/presence ─────────────────────────────────────
+        if path == "me/presence":
+            return self._my_presence_response()
+
+        # ── /me/todo/lists ───────────────────────────────────
+        if re.match(r"me/todo/lists/[^/]+/tasks/[^/]+$", path):
+            parts = path.split("/")
+            return self._single_task_response(parts[3], parts[5])
+        if re.match(r"me/todo/lists/[^/]+/tasks", path):
+            list_id = path.split("/")[3]
+            return self._tasks_response(list_id)
+        if path == "me/todo/lists":
+            return self._task_lists_response()
+
+        # ── /me/people ───────────────────────────────────────
+        if path.startswith("me/people"):
+            return self._people_response()
+
+        # ── /me/contacts ─────────────────────────────────────
+        if path.startswith("me/contacts"):
+            return self._contacts_response()
+
+        # ── /me/onlineMeetings ───────────────────────────────
+        if re.match(r"me/onlineMeetings/[^/]+$", path):
+            meeting_id = path.split("/")[2]
+            return self._single_meeting_response(meeting_id)
+        if path.startswith("me/onlineMeetings"):
+            return self._online_meetings_response()
+
+        # ── /places ──────────────────────────────────────────
+        if path == "places/microsoft.graph.room":
+            return self._rooms_response()
+        if path == "places/microsoft.graph.roomList":
+            return self._room_lists_response()
+
+        # ── /communications/getPresencesByUserId ─────────────
+        if path == "communications/getPresencesByUserId":
+            return self._presences_by_user_id_response(json_body)
+
+        # ── /users/{id}/presence ─────────────────────────────
+        if re.match(r"users/[^/]+/presence$", path):
+            user_id = path.split("/")[1]
+            return self._user_presence_response(user_id)
 
         # ── /users/* ─────────────────────────────────────────
         if path.startswith("users/") or path == "users":
@@ -224,7 +272,28 @@ class MockGraphTransport:
         return _make_response(200, {
             "timeZone": "Europe/Berlin",
             "language": {"locale": "de-DE", "displayName": "Deutsch"},
-            "automaticRepliesSetting": {"status": "disabled"},
+            "dateFormat": "dd.MM.yyyy",
+            "timeFormat": "HH:mm",
+            "automaticRepliesSetting": {
+                "status": "disabled",
+                "externalAudience": "none",
+                "internalReplyMessage": "",
+                "externalReplyMessage": "",
+                "scheduledStartDateTime": {
+                    "dateTime": "2026-04-06T00:00:00.0000000",
+                    "timeZone": "Europe/Berlin",
+                },
+                "scheduledEndDateTime": {
+                    "dateTime": "2026-04-07T00:00:00.0000000",
+                    "timeZone": "Europe/Berlin",
+                },
+            },
+            "workingHours": {
+                "daysOfWeek": ["monday", "tuesday", "wednesday", "thursday", "friday"],
+                "startTime": "08:00:00.0000000",
+                "endTime": "17:00:00.0000000",
+                "timeZone": {"name": "Europe/Berlin"},
+            },
         })
 
     def _mail_folder_response(self, path: str, method: str,
@@ -394,3 +463,348 @@ class MockGraphTransport:
             if u.get("id") == user_id or u.get("mail", "").lower() == user_id.lower():
                 return _make_response(200, u)
         return _make_response(404, {"error": {"code": "Request_ResourceNotFound"}})
+
+    # ── Presence ─────────────────────────────────────────────
+
+    def _my_presence_response(self) -> _MockResponse:
+        return _make_response(200, {
+            "id": self._profile.user_id,
+            "availability": "Available",
+            "activity": "Available",
+        })
+
+    def _user_presence_response(self, user_id: str) -> _MockResponse:
+        return _make_response(200, {
+            "id": user_id,
+            "availability": "Available",
+            "activity": "Available",
+        })
+
+    def _presences_by_user_id_response(self, json_body: dict | None) -> _MockResponse:
+        ids = (json_body or {}).get("ids", [])
+        presences = []
+        for uid in ids:
+            presences.append({
+                "id": uid,
+                "availability": "Available",
+                "activity": "Available",
+            })
+        return _make_response(200, {"value": presences})
+
+    # ── Tasks (To Do) ────────────────────────────────────────
+
+    _TASK_LISTS = [
+        {"id": "tasklist-tasks", "displayName": "Tasks", "isOwner": True, "isShared": False,
+         "wellknownListName": "defaultList"},
+        {"id": "tasklist-shopping", "displayName": "Einkaufsliste", "isOwner": True, "isShared": False,
+         "wellknownListName": "none"},
+        {"id": "tasklist-work", "displayName": "Arbeitsprojekte", "isOwner": True, "isShared": True,
+         "wellknownListName": "none"},
+    ]
+
+    _TASKS_BY_LIST: dict[str, list[dict]] = {
+        "tasklist-tasks": [
+            {"id": "task-001", "title": "Quartalsbericht vorbereiten", "status": "notStarted",
+             "importance": "high", "isReminderOn": True,
+             "dueDateTime": {"dateTime": "2026-04-10T17:00:00.0000000", "timeZone": "Europe/Berlin"},
+             "body": {"contentType": "text", "content": "Q1 Bericht fuer Management erstellen"}},
+            {"id": "task-002", "title": "Reisekosten einreichen", "status": "inProgress",
+             "importance": "normal", "isReminderOn": False,
+             "dueDateTime": {"dateTime": "2026-04-08T17:00:00.0000000", "timeZone": "Europe/Berlin"},
+             "body": {"contentType": "text", "content": ""}},
+            {"id": "task-003", "title": "Teammeeting planen", "status": "completed",
+             "importance": "normal", "isReminderOn": False,
+             "dueDateTime": {"dateTime": "2026-04-05T12:00:00.0000000", "timeZone": "Europe/Berlin"},
+             "body": {"contentType": "text", "content": ""}},
+        ],
+        "tasklist-shopping": [
+            {"id": "task-010", "title": "Druckerpapier bestellen", "status": "notStarted",
+             "importance": "normal", "isReminderOn": False,
+             "dueDateTime": None,
+             "body": {"contentType": "text", "content": "A4, 80g/m2, 5 Pakete"}},
+            {"id": "task-011", "title": "Kaffee fuer Kueche", "status": "notStarted",
+             "importance": "low", "isReminderOn": False,
+             "dueDateTime": None,
+             "body": {"contentType": "text", "content": ""}},
+            {"id": "task-012", "title": "Whiteboardmarker", "status": "notStarted",
+             "importance": "low", "isReminderOn": False,
+             "dueDateTime": None,
+             "body": {"contentType": "text", "content": "Schwarz, Rot, Blau, Gruen"}},
+        ],
+        "tasklist-work": [
+            {"id": "task-020", "title": "API-Dokumentation aktualisieren", "status": "inProgress",
+             "importance": "high", "isReminderOn": True,
+             "dueDateTime": {"dateTime": "2026-04-15T17:00:00.0000000", "timeZone": "Europe/Berlin"},
+             "body": {"contentType": "text", "content": "Neue Endpoints dokumentieren"}},
+            {"id": "task-021", "title": "Code-Review fuer Feature-Branch", "status": "notStarted",
+             "importance": "high", "isReminderOn": False,
+             "dueDateTime": {"dateTime": "2026-04-09T12:00:00.0000000", "timeZone": "Europe/Berlin"},
+             "body": {"contentType": "text", "content": ""}},
+            {"id": "task-022", "title": "Unit-Tests erweitern", "status": "notStarted",
+             "importance": "normal", "isReminderOn": False,
+             "dueDateTime": {"dateTime": "2026-04-12T17:00:00.0000000", "timeZone": "Europe/Berlin"},
+             "body": {"contentType": "text", "content": "Coverage auf 80% erhoehen"}},
+            {"id": "task-023", "title": "Performance-Optimierung DB-Queries", "status": "notStarted",
+             "importance": "normal", "isReminderOn": False,
+             "dueDateTime": {"dateTime": "2026-04-20T17:00:00.0000000", "timeZone": "Europe/Berlin"},
+             "body": {"contentType": "text", "content": ""}},
+            {"id": "task-024", "title": "Deployment-Pipeline pruefen", "status": "completed",
+             "importance": "normal", "isReminderOn": False,
+             "dueDateTime": {"dateTime": "2026-04-04T17:00:00.0000000", "timeZone": "Europe/Berlin"},
+             "body": {"contentType": "text", "content": ""}},
+        ],
+    }
+
+    def _task_lists_response(self) -> _MockResponse:
+        return _make_response(200, {"value": self._TASK_LISTS})
+
+    def _tasks_response(self, list_id: str) -> _MockResponse:
+        tasks = self._TASKS_BY_LIST.get(list_id, [])
+        return _make_response(200, {"value": tasks})
+
+    def _single_task_response(self, list_id: str, task_id: str) -> _MockResponse:
+        tasks = self._TASKS_BY_LIST.get(list_id, [])
+        for task in tasks:
+            if task["id"] == task_id:
+                return _make_response(200, task)
+        return _make_response(404, {"error": {"code": "itemNotFound", "message": "Task not found"}})
+
+    # ── People ───────────────────────────────────────────────
+
+    def _people_response(self) -> _MockResponse:
+        people = [
+            {
+                "id": "person-001",
+                "displayName": "Max Mustermann",
+                "givenName": "Max",
+                "surname": "Mustermann",
+                "emailAddresses": [{"address": "max.mustermann@example.com", "rank": 1}],
+                "department": "Vertrieb",
+                "jobTitle": "Vertriebsleiter",
+                "companyName": "Example GmbH",
+                "personType": {"class": "Person", "subclass": "OrganizationUser"},
+            },
+            {
+                "id": "person-002",
+                "displayName": "Anna Schmidt",
+                "givenName": "Anna",
+                "surname": "Schmidt",
+                "emailAddresses": [{"address": "anna.schmidt@example.com", "rank": 1}],
+                "department": "Engineering",
+                "jobTitle": "Software-Entwicklerin",
+                "companyName": "Example GmbH",
+                "personType": {"class": "Person", "subclass": "OrganizationUser"},
+            },
+            {
+                "id": "person-003",
+                "displayName": "Thomas Weber",
+                "givenName": "Thomas",
+                "surname": "Weber",
+                "emailAddresses": [{"address": "thomas.weber@example.com", "rank": 1}],
+                "department": "Marketing",
+                "jobTitle": "Marketing-Manager",
+                "companyName": "Example GmbH",
+                "personType": {"class": "Person", "subclass": "OrganizationUser"},
+            },
+            {
+                "id": "person-004",
+                "displayName": "Lisa Mueller",
+                "givenName": "Lisa",
+                "surname": "Mueller",
+                "emailAddresses": [{"address": "lisa.mueller@example.com", "rank": 1}],
+                "department": "Personal",
+                "jobTitle": "HR-Leiterin",
+                "companyName": "Example GmbH",
+                "personType": {"class": "Person", "subclass": "OrganizationUser"},
+            },
+            {
+                "id": "person-005",
+                "displayName": "Stefan Braun",
+                "givenName": "Stefan",
+                "surname": "Braun",
+                "emailAddresses": [{"address": "stefan.braun@example.com", "rank": 1}],
+                "department": "Finanzen",
+                "jobTitle": "Controller",
+                "companyName": "Example GmbH",
+                "personType": {"class": "Person", "subclass": "OrganizationUser"},
+            },
+        ]
+        return _make_response(200, {"value": people})
+
+    def _contacts_response(self) -> _MockResponse:
+        contacts = [
+            {
+                "id": "contact-001",
+                "givenName": "Klaus",
+                "surname": "Fischer",
+                "displayName": "Klaus Fischer",
+                "emailAddresses": [{"address": "klaus.fischer@partner.de", "name": "Klaus Fischer"}],
+                "businessPhones": ["+49 711 1234567"],
+                "companyName": "Partner AG",
+                "jobTitle": "Geschaeftsfuehrer",
+                "department": "Geschaeftsleitung",
+            },
+            {
+                "id": "contact-002",
+                "givenName": "Maria",
+                "surname": "Hoffmann",
+                "displayName": "Maria Hoffmann",
+                "emailAddresses": [{"address": "maria.hoffmann@kunde.de", "name": "Maria Hoffmann"}],
+                "businessPhones": ["+49 711 7654321"],
+                "companyName": "Kunde GmbH",
+                "jobTitle": "Einkaufsleiterin",
+                "department": "Einkauf",
+            },
+            {
+                "id": "contact-003",
+                "givenName": "Peter",
+                "surname": "Zimmermann",
+                "displayName": "Peter Zimmermann",
+                "emailAddresses": [{"address": "peter.zimmermann@lieferant.de", "name": "Peter Zimmermann"}],
+                "businessPhones": ["+49 711 9876543"],
+                "companyName": "Lieferant KG",
+                "jobTitle": "Technischer Leiter",
+                "department": "Technik",
+            },
+        ]
+        return _make_response(200, {"value": contacts})
+
+    # ── Places ───────────────────────────────────────────────
+
+    def _rooms_response(self) -> _MockResponse:
+        rooms = [
+            {
+                "id": "room-stuttgart",
+                "displayName": "Raum Stuttgart",
+                "emailAddress": "raum.stuttgart@example.com",
+                "capacity": 12,
+                "building": "Hauptgebaeude",
+                "floorNumber": 2,
+                "isWheelChairAccessible": True,
+                "audioDeviceName": "Jabra Speak 750",
+                "videoDeviceName": "Logitech Rally",
+                "phone": "+49 711 1000001",
+            },
+            {
+                "id": "room-heidelberg",
+                "displayName": "Raum Heidelberg",
+                "emailAddress": "raum.heidelberg@example.com",
+                "capacity": 8,
+                "building": "Hauptgebaeude",
+                "floorNumber": 1,
+                "isWheelChairAccessible": True,
+                "audioDeviceName": "Jabra Speak 510",
+                "videoDeviceName": None,
+                "phone": "+49 711 1000002",
+            },
+            {
+                "id": "room-reutlingen",
+                "displayName": "Raum Reutlingen",
+                "emailAddress": "raum.reutlingen@example.com",
+                "capacity": 20,
+                "building": "Neubau",
+                "floorNumber": 3,
+                "isWheelChairAccessible": True,
+                "audioDeviceName": "Poly Studio",
+                "videoDeviceName": "Poly Studio X50",
+                "phone": "+49 711 1000003",
+            },
+            {
+                "id": "room-tuebingen",
+                "displayName": "Raum Tuebingen",
+                "emailAddress": "raum.tuebingen@example.com",
+                "capacity": 4,
+                "building": "Neubau",
+                "floorNumber": 1,
+                "isWheelChairAccessible": False,
+                "audioDeviceName": None,
+                "videoDeviceName": None,
+                "phone": None,
+            },
+        ]
+        return _make_response(200, {"value": rooms})
+
+    def _room_lists_response(self) -> _MockResponse:
+        room_lists = [
+            {
+                "id": "roomlist-hauptgebaeude",
+                "displayName": "Hauptgebaeude",
+                "emailAddress": "hauptgebaeude@example.com",
+            },
+            {
+                "id": "roomlist-neubau",
+                "displayName": "Neubau",
+                "emailAddress": "neubau@example.com",
+            },
+        ]
+        return _make_response(200, {"value": room_lists})
+
+    # ── Mailbox Settings (extended) ──────────────────────────
+
+    def _automatic_replies_response(self) -> _MockResponse:
+        return _make_response(200, {
+            "status": "disabled",
+            "externalAudience": "none",
+            "internalReplyMessage": "",
+            "externalReplyMessage": "",
+            "scheduledStartDateTime": {
+                "dateTime": "2026-04-06T00:00:00.0000000",
+                "timeZone": "Europe/Berlin",
+            },
+            "scheduledEndDateTime": {
+                "dateTime": "2026-04-07T00:00:00.0000000",
+                "timeZone": "Europe/Berlin",
+            },
+        })
+
+    def _working_hours_response(self) -> _MockResponse:
+        return _make_response(200, {
+            "daysOfWeek": ["monday", "tuesday", "wednesday", "thursday", "friday"],
+            "startTime": "08:00:00.0000000",
+            "endTime": "17:00:00.0000000",
+            "timeZone": {"name": "Europe/Berlin"},
+        })
+
+    # ── Online Meetings ──────────────────────────────────────
+
+    _ONLINE_MEETINGS = [
+        {
+            "id": "meeting-001",
+            "subject": "Sprint Planning KW15",
+            "startDateTime": "2026-04-07T09:00:00Z",
+            "endDateTime": "2026-04-07T10:00:00Z",
+            "joinWebUrl": "https://teams.microsoft.com/l/meetup-join/mock-meeting-001",
+            "videoTeleconferenceId": "123456789",
+            "chatInfo": {"threadId": "19:meeting_mock001@thread.v2"},
+            "participants": {
+                "organizer": {
+                    "upn": "mock@example.com",
+                    "identity": {"user": {"displayName": "Mock User"}},
+                },
+            },
+        },
+        {
+            "id": "meeting-002",
+            "subject": "Projektstatus Besprechung",
+            "startDateTime": "2026-04-08T14:00:00Z",
+            "endDateTime": "2026-04-08T15:30:00Z",
+            "joinWebUrl": "https://teams.microsoft.com/l/meetup-join/mock-meeting-002",
+            "videoTeleconferenceId": "987654321",
+            "chatInfo": {"threadId": "19:meeting_mock002@thread.v2"},
+            "participants": {
+                "organizer": {
+                    "upn": "max.mustermann@example.com",
+                    "identity": {"user": {"displayName": "Max Mustermann"}},
+                },
+            },
+        },
+    ]
+
+    def _online_meetings_response(self) -> _MockResponse:
+        return _make_response(200, {"value": self._ONLINE_MEETINGS})
+
+    def _single_meeting_response(self, meeting_id: str) -> _MockResponse:
+        for meeting in self._ONLINE_MEETINGS:
+            if meeting["id"] == meeting_id:
+                return _make_response(200, meeting)
+        return _make_response(404, {"error": {"code": "itemNotFound", "message": "Meeting not found"}})

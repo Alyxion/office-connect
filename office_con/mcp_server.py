@@ -354,6 +354,42 @@ TOOLS = [
             "required": ["user_id"],
         },
     ),
+
+    # ── Rooms / Places ────────────────────────────────────────────────
+    Tool(
+        name="o365_list_rooms",
+        description=(
+            "List meeting rooms. Returns room name, capacity, building, and floor.\n"
+            "Use the room name with o365_get_room_availability to check bookings."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "filter": {"type": "string", "description": "Filter rooms by name substring (case-insensitive, optional)"},
+            },
+            "required": [],
+        },
+    ),
+    Tool(
+        name="o365_get_room_availability",
+        description=(
+            "Get the availability schedule for one or more meeting rooms today.\n"
+            "Returns time slots with free/busy status. Booking subject names are hidden by default.\n"
+            "Pass room names (from o365_list_rooms) as a list."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "rooms": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Room names (or name substrings) to check",
+                },
+                "date": {"type": "string", "description": "Date in YYYY-MM-DD format (default: today)"},
+            },
+            "required": ["rooms"],
+        },
+    ),
 ]
 
 
@@ -377,7 +413,8 @@ def _json_result(obj: Any) -> list[TextContent]:
     return [TextContent(type="text", text=text)]
 
 
-async def _handle_tool(graph: MsGraphInstance, name: str, args: dict[str, Any]) -> list[TextContent]:
+async def _handle_tool(graph: MsGraphInstance, name: str, args: dict[str, Any],
+                       *, show_room_booking_names: bool = False) -> list[TextContent]:
     """Route a tool call to the appropriate handler."""
 
     # ── Profile ───────────────────────────────────────────────────────
@@ -533,7 +570,153 @@ async def _handle_tool(graph: MsGraphInstance, name: str, args: dict[str, Any]) 
         result = await directory.get_user_manager_async(args["user_id"])
         return _json_result(result)
 
+    # ── Rooms / Places ────────────────────────────────────────────────
+    if name == "o365_list_rooms":
+        from office_con.msgraph.places_handler import PlacesHandler
+        ph = PlacesHandler(graph)
+        rooms = await ph.get_rooms_async()
+        name_filter = args.get("filter", "").lower()
+        if name_filter:
+            rooms = [r for r in rooms if name_filter in r.get("displayName", "").lower()]
+        result = [
+            {
+                "name": r.get("displayName", ""),
+                "email": r.get("emailAddress", ""),
+                "capacity": r.get("capacity"),
+                "building": r.get("building"),
+                "floor": r.get("floorNumber"),
+            }
+            for r in rooms
+        ]
+        return _json_result(result)
+
+    if name == "o365_get_room_availability":
+        from office_con.msgraph.places_handler import PlacesHandler
+        from office_con.msgraph.mailbox_settings_handler import MailboxSettingsHandler
+        from datetime import datetime as _dt, timezone as _tz
+        from zoneinfo import ZoneInfo as _ZI
+
+        # Resolve user timezone
+        mbs = MailboxSettingsHandler(graph)
+        settings = await mbs.get_mailbox_settings_async()
+        _WIN_TZ = {
+            "W. Europe Standard Time": "Europe/Berlin",
+            "Central European Standard Time": "Europe/Berlin",
+            "Romance Standard Time": "Europe/Paris",
+            "GMT Standard Time": "Europe/London",
+            "Eastern Standard Time": "America/New_York",
+            "Central Standard Time": "America/Chicago",
+            "Pacific Standard Time": "America/Los_Angeles",
+            "China Standard Time": "Asia/Shanghai",
+            "India Standard Time": "Asia/Kolkata",
+        }
+        win_tz = settings.get("timeZone", "W. Europe Standard Time")
+        iana_tz = _WIN_TZ.get(win_tz, win_tz)
+        local_tz = _ZI(iana_tz)
+
+        # Resolve date
+        date_str = args.get("date", "")
+        if date_str:
+            target_date = _dt.strptime(date_str, "%Y-%m-%d").date()
+        else:
+            target_date = _dt.now(local_tz).date()
+
+        # Find matching rooms by name
+        ph = PlacesHandler(graph)
+        all_rooms = await ph.get_rooms_async()
+        room_queries = args.get("rooms", [])
+        matched = []
+        for rq in room_queries:
+            rq_lower = rq.lower()
+            for r in all_rooms:
+                if rq_lower in r.get("displayName", "").lower() and r not in matched:
+                    matched.append(r)
+
+        if not matched:
+            return [TextContent(type="text", text="No matching rooms found.")]
+
+        emails = [r["emailAddress"] for r in matched]
+
+        # Query schedule
+        start_str = f"{target_date.isoformat()}T07:00:00"
+        end_str = f"{target_date.isoformat()}T20:00:00"
+        body = {
+            "schedules": emails,
+            "startTime": {"dateTime": start_str, "timeZone": win_tz},
+            "endTime": {"dateTime": end_str, "timeZone": win_tz},
+            "availabilityViewInterval": 30,
+        }
+        token = await graph.get_access_token_async()
+        resp = await graph.run_async(
+            url=graph.msg_endpoint + "me/calendar/getSchedule",
+            method="POST", json=body, token=token,
+        )
+        schedules = resp.json().get("value", [])
+
+        email_to_name = {r["emailAddress"].lower(): r["displayName"] for r in matched}
+        result = []
+        for sched in schedules:
+            email = sched.get("scheduleId", "").lower()
+            room_name = email_to_name.get(email, email)
+            items = sched.get("scheduleItems", [])
+            bookings = []
+            for item in items:
+                s = item.get("start", {}).get("dateTime", "")
+                e = item.get("end", {}).get("dateTime", "")
+                if s and e:
+                    # Convert UTC → local
+                    st = _dt.fromisoformat(s.rstrip("Z")).replace(tzinfo=_tz.utc).astimezone(local_tz)
+                    en = _dt.fromisoformat(e.rstrip("Z")).replace(tzinfo=_tz.utc).astimezone(local_tz)
+                    booking = {
+                        "start": st.strftime("%H:%M"),
+                        "end": en.strftime("%H:%M"),
+                        "status": item.get("status", "busy"),
+                    }
+                    if show_room_booking_names:
+                        booking["subject"] = item.get("subject", "")
+                    bookings.append(booking)
+            result.append({
+                "room": room_name,
+                "date": target_date.isoformat(),
+                "timezone": iana_tz,
+                "bookings": bookings,
+                "free_slots": _compute_free_slots(bookings),
+            })
+        return _json_result(result)
+
     return [TextContent(type="text", text=f"Unknown tool: {name}")]
+
+
+def _compute_free_slots(bookings: list[dict]) -> list[dict]:
+    """Compute free 30-min slots between 07:00 and 20:00 from a list of bookings."""
+    busy = set()
+    for b in bookings:
+        start_h, start_m = map(int, b["start"].split(":"))
+        end_h, end_m = map(int, b["end"].split(":"))
+        t = start_h * 60 + start_m
+        end = end_h * 60 + end_m
+        while t < end:
+            busy.add(t)
+            t += 30
+
+    free = []
+    t = 7 * 60
+    while t < 20 * 60:
+        if t not in busy:
+            h, m = divmod(t, 60)
+            free.append({"start": f"{h:02d}:{m:02d}", "end": f"{h:02d}:{m + 30:02d}" if m == 0 else f"{h + 1:02d}:00"})
+        t += 30
+
+    # Merge consecutive free slots
+    if not free:
+        return []
+    merged = [free[0].copy()]
+    for slot in free[1:]:
+        if merged[-1]["end"] == slot["start"]:
+            merged[-1]["end"] = slot["end"]
+        else:
+            merged.append(slot.copy())
+    return merged
 
 
 # ---------------------------------------------------------------------------
