@@ -13,19 +13,28 @@ class OfficeUserConfig(BaseModel):
 
 class OfficeUserInstance:
     """High-level Office 365 user session — wraps MsGraphInstance with scoped feature access."""
-    PROFILE_SCOPE = ["User.Read"]
-    """A scope to read the user profile such as name, email, etc."""
-    DIRECTORY_SCOPE = ["Directory.Read.All", "ProfilePhoto.Read.All"]
-    """A scope to read the directory such as hierarchy and profile images."""
-    MAIL_SCOPE = ["Mail.Read", "Mail.Read.Shared", "Mail.ReadWrite", "Mail.ReadWrite.Shared", "Mail.Send",
-                  "Mail.Send.Shared", "User.ReadBasic.All"] #
-    """A scope to read and write mails."""
-    CALENDAR_SCOPE = ["Calendars.ReadWrite"]
-    """A scope to read and write the calendar."""
-    CHAT_SCOPE = ["Chat.Read", "ChannelMessage.Read.All"]
-    """A scope to read and write the chat."""
-    ONE_DRIVE_SCOPE = ["Files.Read.All", "Files.ReadWrite.All"]
-    """A scope to read and write from and to OneDrive."""
+    PROFILE_SCOPE = ["User.Read", "User.Read.All", "User.ReadBasic.All",
+                     "People.Read", "Presence.Read.All"]
+    """User profile, people search, and presence status."""
+    DIRECTORY_SCOPE = ["Directory.Read.All", "ProfilePhoto.Read.All", "Contacts.Read"]
+    """Company directory, profile photos, and contacts."""
+    MAIL_SCOPE = ["Mail.Read", "Mail.ReadBasic", "Mail.Read.Shared", "Mail.ReadBasic.Shared",
+                  "Mail.ReadWrite", "Mail.ReadWrite.Shared", "Mail.Send", "Mail.Send.Shared",
+                  "MailboxSettings.ReadWrite"]
+    """Read, write, and send mail (own + shared mailboxes) + mailbox settings."""
+    CALENDAR_SCOPE = ["Calendars.Read", "Calendars.ReadWrite", "Calendars.ReadWrite.Shared",
+                      "Place.Read.All", "OnlineMeetings.ReadWrite"]
+    """Calendars (own + shared), room/place lookup, and Teams meetings."""
+    CHAT_SCOPE = ["Chat.Read", "Chat.ReadWrite", "Chat.Create",
+                  "ChannelMessage.Read.All", "ChannelMessage.ReadWrite"]
+    """Teams chats and channel messages."""
+    TEAMS_SCOPE = ["Team.ReadBasic.All", "TeamMember.Read.All", "Channel.ReadBasic.All"]
+    """Teams structure — teams, channels, and members."""
+    ONE_DRIVE_SCOPE = ["Files.Read.All", "Files.ReadWrite", "Files.ReadWrite.All",
+                       "Sites.Read.All"]
+    """OneDrive, SharePoint files, and site document libraries."""
+    TASKS_SCOPE = ["Tasks.ReadWrite"]
+    """Microsoft To Do / Planner tasks."""
 
     def __init__(self, config: Optional[OfficeUserConfig] = None,
                  user_instance: MsGraphInstance | DBUserInstance | WebUserInstance | None = None):
