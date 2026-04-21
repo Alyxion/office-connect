@@ -116,7 +116,7 @@ class MockGraphTransport:
 
         # ── /me/messages ─────────────────────────────────────
         if path.startswith("me/messages"):
-            return self._messages_response(path, method, json_body)
+            return self._messages_response(path, method, json_body, qs)
 
         # ── /me/sendMail ─────────────────────────────────────
         if path == "me/sendMail":
@@ -366,7 +366,12 @@ class MockGraphTransport:
         })
 
     def _messages_response(self, path: str, method: str,
-                           json_body: dict | None) -> _MockResponse:
+                           json_body: dict | None,
+                           qs: dict | None = None) -> _MockResponse:
+        # POST me/messages/{id}/move
+        if method == "POST" and path.endswith("/move"):
+            dest = (json_body or {}).get("destinationId", "moved-folder")
+            return _make_response(200, {"id": _uid(), "webLink": "https://outlook.office.com/mock"})
         # POST me/messages/{id}/reply
         if method == "POST" and path.endswith("/reply"):
             return _make_response(202, {})
@@ -376,6 +381,9 @@ class MockGraphTransport:
         # POST me/messages/{id}/send
         if method == "POST" and path.endswith("/send"):
             return _make_response(202, {})
+        # DELETE me/messages/{id}
+        if method == "DELETE":
+            return _make_response(204, {})
         if method == "PATCH":
             # Mark read, set categories, etc.
             return _make_response(200, json_body or {})
@@ -385,6 +393,18 @@ class MockGraphTransport:
             draft.setdefault("id", _uid())
             draft.setdefault("webLink", "https://outlook.office.com/mock")
             return _make_response(201, draft)
+        # GET with $search — filter messages by subject/body
+        qs = qs or {}
+        search_term = qs.get("$search", [None])[0]
+        if search_term:
+            search_lower = search_term.strip('"').lower()
+            matched = [
+                m for m in self._profile.mail_messages
+                if search_lower in (m.get("subject", "") or "").lower()
+                or search_lower in (m.get("bodyPreview", "") or "").lower()
+            ]
+            top = int(qs.get("$top", [str(len(matched))])[0])
+            return _make_response(200, {"value": matched[:top]})
         # GET single message by ID — extract ID from path like me/messages/{id}
         parts = path.rstrip("/").split("/")
         msg_id = parts[-1] if len(parts) >= 2 else ""

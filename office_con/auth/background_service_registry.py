@@ -41,7 +41,10 @@ class BackgroundServiceRegistry:
                 if asyncio.iscoroutine(result):
                     await result
             except Exception as e:
-                print(f"Error in login callback: {e}")
+                try:
+                    print(f"Error in login callback: {e}")
+                except Exception:
+                    pass  # stdout may be broken (e.g. NiceGUI pipe)
 
     def notify_logout(self, user_id: str):
         """Notify all registered callbacks about a user logout"""

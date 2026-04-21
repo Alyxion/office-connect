@@ -1,4 +1,6 @@
 import base64
+import hashlib
+import json
 import logging
 from datetime import datetime, timezone
 from typing import List, Optional, Dict
@@ -52,11 +54,163 @@ class OfficeMail(BaseModel):
     attachments: List[OfficeMailAttachment] = Field(default_factory=list, description="File and inline attachments")
     zip_data: Optional[bytes] = Field(default=None, description="Compressed attachment bundle for transport")
 
+    @property
+    def scanning(self) -> bool:
+        """Virus-scan detection: True when Graph indicates attachments exist
+        but none are available yet (scan in progress), or when a placeholder
+        'virus scan in progress.html' attachment is present.
+
+        Only meaningful after a full message fetch (``$expand=attachments``).
+        Index queries never populate ``attachments``, so callers listing
+        messages should not use this property — see ``_mail_to_row``.
+        """
+        if not self.has_attachments:
+            return False
+        if any(a.name.lower() == "virus scan in progress.html" for a in self.attachments):
+            return True
+        return len(self.attachments) == 0
+
 
 class OfficeMailList(BaseModel):
     """Paginated list of Outlook email messages."""
     elements: List[OfficeMail] = Field(default_factory=list, description="Email messages in this page")
     total_mails: int = Field(default=0, description="Total number of mails in the folder")
+
+
+class FolderInfo(BaseModel):
+    """A mail folder with counts."""
+    id: str = Field(description="MS Graph folder id")
+    name: str = Field(default="", description="Display name")
+    unread: int = Field(default=0, description="Unread message count")
+    total: int = Field(default=0, description="Total message count")
+    parent_id: str | None = Field(default=None, description="Parent folder id for tree rendering")
+
+
+class MoveResult(BaseModel):
+    """Result of moving a message to another folder."""
+    id: str = Field(description="New message id in the destination folder")
+    web_link: str = Field(default="", description="Outlook Web App URL")
+
+
+def compute_folder_signature(rows: list[dict]) -> str:
+    """Cache-busting signature for a folder's message list.
+
+    Rows are sorted by ``id`` before hashing so that Graph API
+    pagination-order jitter does not produce false cache misses.
+
+    Returns 16 hex characters of SHA-256.
+    """
+    h = hashlib.sha256()
+    for row in sorted(rows, key=lambda r: r["id"]):
+        h.update(json.dumps(row, sort_keys=True, default=str).encode())
+    return h.hexdigest()[:16]
+
+
+class MailFolderHandler:
+    """Reads and manages Outlook mail folders via the MS Graph API."""
+
+    def __init__(self, wui: "MsGraphInstance"):
+        self.msg = wui
+
+    def _base_path(self, mail_address: str | None = None) -> str:
+        if not mail_address or mail_address == self.msg.email:
+            return "me"
+        return f"users/{mail_address}"
+
+    async def get_folders_async(
+        self, *, include_hidden: bool = True, limit: int = 100,
+        recursive: bool = False, max_depth: int = 6,
+        mail_address: str | None = None,
+    ) -> list[FolderInfo]:
+        """Return a flat list of mail folders with counts + ``parent_id``.
+
+        When ``recursive=True`` we walk ``childFolders`` breadth-first so
+        nested folders (e.g. ``Inbox/News``) appear in the result.  BFS
+        is bounded by ``max_depth`` (6 by default) so a pathological
+        structure can't hang the handler.  ``childFolderCount`` in the
+        response tells us whether a BFS step is worth taking.
+        """
+        access_token = await self.msg.get_access_token_async()
+        if not access_token:
+            return []
+        base = self._base_path(mail_address)
+        root_url = (
+            f"{self.msg.msg_endpoint}{base}/mailFolders"
+            f"?$select=id,displayName,totalItemCount,unreadItemCount,parentFolderId,childFolderCount"
+            f"&$top={limit}"
+        )
+        if include_hidden:
+            root_url += "&$includeHiddenFolders=true"
+        resp = await self.msg.run_async(url=root_url, token=access_token)
+        if resp is None or resp.status_code != 200:
+            return []
+        all_rows: list[dict] = list(resp.json().get("value", []))
+
+        if recursive:
+            # BFS through ``childFolders`` for every folder that reports
+            # at least one child.  Each level costs one request per
+            # parent with children — for typical mailboxes (≤50 folders
+            # total) this is a handful of calls.
+            queue = [r for r in all_rows if (r.get("childFolderCount") or 0) > 0]
+            depth = 0
+            seen_ids = {r["id"] for r in all_rows}
+            while queue and depth < max_depth:
+                next_queue: list[dict] = []
+                for parent in queue:
+                    child_url = (
+                        f"{self.msg.msg_endpoint}{base}/mailFolders/{parent['id']}/childFolders"
+                        f"?$select=id,displayName,totalItemCount,unreadItemCount,parentFolderId,childFolderCount"
+                        f"&$top={limit}"
+                    )
+                    if include_hidden:
+                        child_url += "&$includeHiddenFolders=true"
+                    r = await self.msg.run_async(url=child_url, token=access_token)
+                    if r is None or r.status_code != 200:
+                        continue
+                    for child in r.json().get("value", []):
+                        if child["id"] in seen_ids:
+                            continue
+                        seen_ids.add(child["id"])
+                        all_rows.append(child)
+                        if (child.get("childFolderCount") or 0) > 0:
+                            next_queue.append(child)
+                queue = next_queue
+                depth += 1
+
+        return [
+            FolderInfo(
+                id=f["id"],
+                name=f.get("displayName", ""),
+                unread=f.get("unreadItemCount", 0),
+                total=f.get("totalItemCount", 0),
+                parent_id=f.get("parentFolderId"),
+            )
+            for f in all_rows
+        ]
+
+    async def get_folder_async(
+        self, folder_id: str, *, mail_address: str | None = None,
+    ) -> FolderInfo | None:
+        """Return a single mail folder by ID, or None if not found."""
+        access_token = await self.msg.get_access_token_async()
+        if not access_token:
+            return None
+        base = self._base_path(mail_address)
+        url = (
+            f"{self.msg.msg_endpoint}{base}/mailFolders/{folder_id}"
+            f"?$select=id,displayName,totalItemCount,unreadItemCount,parentFolderId"
+        )
+        resp = await self.msg.run_async(url=url, token=access_token)
+        if resp is None or resp.status_code != 200:
+            return None
+        f = resp.json()
+        return FolderInfo(
+            id=f["id"],
+            name=f.get("displayName", ""),
+            unread=f.get("unreadItemCount", 0),
+            total=f.get("totalItemCount", 0),
+            parent_id=f.get("parentFolderId"),
+        )
 
 
 class OfficeMailHandler:
@@ -213,31 +367,53 @@ class OfficeMailHandler:
             return None
         return response.json()
 
-    async def email_index_async(self, limit: int = 40, skip: int = 0, mail_address: Optional[str] = None) -> OfficeMailList:
+    async def email_index_async(
+        self, limit: int = 40, skip: int = 0, *,
+        mail_address: Optional[str] = None,
+        folder_id: str | None = None,
+        query: str | None = None,
+    ) -> OfficeMailList:
+        """List or search messages.
+
+        When *query* is provided, performs a full-text ``$search`` across
+        all folders (``folder_id`` is ignored).  Otherwise lists messages
+        in the given folder (defaults to Inbox).
+        """
         if mail_address is None:
             mail_address = self.msg.email
         access_token = await self.msg.get_access_token_async()
-
         if not access_token:
             return OfficeMailList()
 
-        fields = "isRead,id,from,subject,bodyPreview,receivedDateTime,hasAttachments,categories,importance,webLink"
+        base = "me" if not mail_address or mail_address == self.msg.email else f"users/{mail_address}"
 
-        if not mail_address or mail_address == self.msg.email:
-            url = f"{self.msg.msg_endpoint}me/mailFolders/inbox/messages?$select={fields}&top={limit}&skip={skip}&$count=true"
+        if query is not None:
+            safe_q = query.replace('"', '\\"')
+            fields = "id,from,subject,bodyPreview,receivedDateTime,isRead,hasAttachments,categories,importance"
+            url = (
+                f'{self.msg.msg_endpoint}{base}/messages'
+                f'?$search="{safe_q}"&$select={fields}&$top={limit}'
+            )
         else:
-            url = f"{self.msg.msg_endpoint}users/{mail_address}/mailFolders/Inbox/messages?$select={fields}&top={limit}&skip={skip}&$count=true"
+            fields = "isRead,id,from,subject,bodyPreview,receivedDateTime,hasAttachments,categories,importance,webLink"
+            folder = folder_id or "inbox"
+            url = (
+                f"{self.msg.msg_endpoint}{base}/mailFolders/{folder}/messages"
+                f"?$select={fields}&$top={limit}&$skip={skip}"
+                f"&$orderby=receivedDateTime desc&$count=true"
+            )
+
         response = await self.msg.run_async(url=url, token=access_token)
         if response is None or response.status_code != 200:
             return OfficeMailList()
         json_object = response.json()
         emails = json_object.get('value', [])
-        total_count = json_object.get('@odata.count', 0)
+        total_count = json_object.get('@odata.count', len(emails))
         email_list = []
         end_point = (self.msg.msg_endpoint or "").rstrip('/')
         for email in emails:
             new_mail = self.parse_mail(email)
-            new_mail.email_url = f"{end_point}/users/{mail_address}/messages/{new_mail.email_id}"
+            new_mail.email_url = f"{end_point}/{base}/messages/{new_mail.email_id}"
             email_list.append(new_mail)
 
         return OfficeMailList(elements=email_list, total_mails=total_count)
@@ -379,9 +555,8 @@ class OfficeMailHandler:
                 "contentBytes": base64.b64encode(att.content_bytes).decode(),
             }
             resp = await self.msg.run_async(url=url, method="POST", json=payload, token=access_token)
-            status = getattr(resp, 'status_code', None)
-            _log.info("[MailHandler]   response: status=%s", status)
-            if resp is not None and status == 201:
+            _log.info("[MailHandler]   response: status=%s", resp.status_code if resp is not None else None)
+            if resp is not None and resp.status_code == 201:
                 added += 1
             else:
                 body_text = ""
@@ -390,7 +565,7 @@ class OfficeMailHandler:
                 except Exception:
                     pass
                 _log.warning("[MailHandler]   FAILED to add attachment %s: status=%s body=%s",
-                             att.name, status, body_text)
+                             att.name, resp.status_code if resp is not None else None, body_text)
         _log.info("[MailHandler] _add_attachments_async: added %d/%d", added, len(attachments))
         return added
 
@@ -472,6 +647,40 @@ class OfficeMailHandler:
         url = f"{self.msg.msg_endpoint}me/messages/{message_id}/send"
         resp = await self.msg.run_async(url=url, method="POST", token=access_token)
         return resp is not None and resp.status_code == 202
+
+    # ── Delete, move ───────────────────────────────────────────────────
+
+    async def delete_message_async(self, message: "str | OfficeMail") -> bool:
+        """Soft-delete a message (moves to Deleted Items)."""
+        msg_id = message.email_id if isinstance(message, OfficeMail) else message
+        access_token = await self.msg.get_access_token_async()
+        if not access_token:
+            return False
+        resp = await self.msg.run_async(
+            url=f"{self.msg.msg_endpoint}me/messages/{msg_id}",
+            method="DELETE", token=access_token,
+        )
+        return resp is not None and resp.status_code < 300
+
+    async def move_message_async(
+        self, message: "str | OfficeMail", destination: "str | FolderInfo",
+    ) -> MoveResult | None:
+        """Move a message to another folder."""
+        msg_id = message.email_id if isinstance(message, OfficeMail) else message
+        folder_id = destination.id if isinstance(destination, FolderInfo) else destination
+        access_token = await self.msg.get_access_token_async()
+        if not access_token:
+            return None
+        resp = await self.msg.run_async(
+            url=f"{self.msg.msg_endpoint}me/messages/{msg_id}/move",
+            method="POST",
+            json={"destinationId": folder_id},
+            token=access_token,
+        )
+        if resp is not None and resp.status_code in (200, 201):
+            data = resp.json()
+            return MoveResult(id=data.get("id", ""), web_link=data.get("webLink", ""))
+        return None
 
 
 class OfficeCategoryColor:
