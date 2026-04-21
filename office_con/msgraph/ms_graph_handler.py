@@ -7,7 +7,7 @@ import aiohttp
 from fastapi.responses import HTMLResponse
 from msal import ConfidentialClientApplication
 
-from office_con.msgraph.mail_handler import OfficeMailHandler
+from office_con.msgraph.mail_handler import OfficeMailHandler, MailFolderHandler
 from office_con.msgraph.profile_handler import ProfileHandler, UserProfile
 from office_con.msgraph.calendar_handler import CalendarHandler
 from ..web_user_instance import WebUserInstance
@@ -171,6 +171,9 @@ class MsGraphInstance(WebUserInstance):
 
     def get_mail(self):
         return OfficeMailHandler(self)
+
+    def get_mail_folders(self):
+        return MailFolderHandler(self)
 
     def get_calendar(self):
         return CalendarHandler(self)
