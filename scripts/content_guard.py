@@ -10,6 +10,8 @@ _BLOCKED = [
     re.compile(r"[Ll][Ee][Cc][Hh][Ll][Ee][Rr]", re.IGNORECASE),
     re.compile(r"[Ss][Pp][Rr][Aa][Yy]", re.IGNORECASE),
     re.compile(r"[Nn][Oo][Zz]{1,2}[Ll][Ee]", re.IGNORECASE),
+    re.compile(r"[Ss][Aa][Ll][Ee][Ss][Bb][Oo][Tt]", re.IGNORECASE),
+    re.compile(r"[Oo][Rr][Dd][Ee][Rr][Aa][Ss][Ss][Ii][Ss][Tt][Aa][Nn][Tt]", re.IGNORECASE),
 ]
 
 _SKIP_EXT = {".woff2", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".zip", ".whl", ".tar.gz"}

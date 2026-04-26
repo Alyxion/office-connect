@@ -105,5 +105,3 @@ poetry run ruff check
 
 - **llming** (`/Users/michael/projects/llming`) — orchestrator for publishing
 - **llming-docs** (`/Users/michael/projects/llming-docs`) — contains the mail app at `apps/mail/` that consumes this library
-- **SalesBot** (`/Users/michael/projects/SalesBot`) — source of truth for `office_con/` at `dependencies/office-mcp/`. Push script: `scripts/sync/push_office_connect.sh`
-- Do NOT modify files in `SalesBot/dependencies/nice-office/`

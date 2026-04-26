@@ -77,8 +77,8 @@ class TestServerSetup:
             assert tool.inputSchema["type"] == "object"
 
     def test_tool_count(self):
-        """Should have 22 tools covering all handler areas."""
-        assert len(TOOLS) == 22
+        """All read + draft + all-tier tools. Update this when adding new tools."""
+        assert len(TOOLS) == 38
 
     def test_tool_names_unique(self):
         names = [t.name for t in TOOLS]
@@ -179,6 +179,17 @@ class TestMailTools:
         data = json.loads(result[0].text)
         assert isinstance(data, list)
 
+    @pytest.mark.asyncio
+    async def test_search_mail_refuses_empty(self, graph: MsGraphInstance):
+        result = await _handle_tool(graph, "o365_search_mail", {})
+        assert "Refused" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_search_mail_by_subject(self, graph: MsGraphInstance):
+        result = await _handle_tool(graph, "o365_search_mail", {"subject": "meeting", "limit": 3})
+        data = json.loads(result[0].text)
+        assert "elements" in data
+
 
 # ---------------------------------------------------------------------------
 # Calendar tools
@@ -239,6 +250,18 @@ class TestCalendarTools:
         })
         data = json.loads(result[0].text)
         assert isinstance(data, list)
+
+    @pytest.mark.asyncio
+    async def test_search_events_refuses_empty(self, graph: MsGraphInstance):
+        result = await _handle_tool(graph, "o365_search_events", {})
+        assert "Refused" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_search_events_by_subject(self, graph: MsGraphInstance):
+        result = await _handle_tool(graph, "o365_search_events", {"subject": "meeting", "limit": 3})
+        data = json.loads(result[0].text)
+        assert "events" in data
+        assert "filter" in data
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +369,19 @@ class TestChatTools:
         data = json.loads(result[0].text)
         assert "members" in data
         assert "total_members" in data
+
+    @pytest.mark.asyncio
+    async def test_search_messages(self, graph: MsGraphInstance):
+        # The call may legitimately return zero hits or fail for scope reasons;
+        # we just verify it doesn't crash and returns the expected shape.
+        result = await _handle_tool(graph, "o365_search_messages",
+                                    {"query": "meeting", "limit": 3})
+        text = result[0].text
+        if "failed" in text.lower():
+            pytest.skip(f"search/query unavailable: {text[:120]}")
+        data = json.loads(text)
+        assert "hits" in data
+        assert "kql" in data
 
 
 # ---------------------------------------------------------------------------
@@ -484,8 +520,15 @@ class TestUnknownTool:
 
 class TestToolCoverage:
 
-    def test_all_tools_have_tests(self):
-        """Every tool defined in TOOLS should be tested above."""
+    def test_all_read_only_tools_have_integration_tests(self):
+        """Every READ_ONLY tool should have a live-Graph test above.
+
+        Write/draft tools are intentionally excluded — invoking them in an
+        integration run would create or send real mail / calendar events.
+        Their gating is covered by tests/test_mcp_permissions.py.
+        """
+        from office_con.mcp_permissions import PermissionLevel
+        from office_con.mcp_server import TOOL_PERMISSIONS
         tested_tools = {
             "o365_get_profile",
             "o365_list_mail",
@@ -509,6 +552,17 @@ class TestToolCoverage:
             "o365_get_site_drives",
             "o365_list_users",
             "o365_get_user_manager",
+            "o365_list_rooms",
+            "o365_get_room_availability",
+            "o365_search_mail",
+            "o365_search_events",
+            "o365_search_messages",
+            "o365_peek_drive_file",
+            "o365_peek_mail_attachment",
         }
-        tool_names = {t.name for t in TOOLS}
-        assert tool_names == tested_tools, f"Untested tools: {tool_names - tested_tools}"
+        read_only_tools = {
+            name for name, lvl in TOOL_PERMISSIONS.items()
+            if lvl is PermissionLevel.READ_ONLY
+        }
+        untested = read_only_tools - tested_tools
+        assert not untested, f"Untested read-only tools: {sorted(untested)}"
