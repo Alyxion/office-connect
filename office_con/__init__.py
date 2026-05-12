@@ -1,4 +1,4 @@
-"""office-mcp -- Microsoft 365 / MS Graph logic layer with MCP server support."""
+"""office-connect — Python library and MCP server for Microsoft 365 via Microsoft Graph."""
 
 __version__ = "0.1.7"
 
