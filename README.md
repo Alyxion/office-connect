@@ -5,9 +5,9 @@
 [![PyPI version](https://img.shields.io/pypi/v/office-connect.svg)](https://pypi.org/project/office-connect/)
 [![Code style: ruff](https://img.shields.io/badge/code%20style-ruff-purple.svg)](https://github.com/astral-sh/ruff)
 
-**Python library and MCP server for Microsoft 365 via MS Graph.**
+**Microsoft 365 superpowers for Python and AI agents.**
 
-office-connect provides structured access to Microsoft 365 data through the MS Graph API. It lets AI assistants and automation tools query mail, calendar, teams, chats, files, directory, and profile information using a simple token-based authentication flow.
+office-connect is a Python library and stdio MCP server that gives both human developers and AI agents structured access to Microsoft 365 — mail, calendar, Teams, chats, files, directory, profile — through the Microsoft Graph API, behind a simple token-based authentication flow.
 
 ## Features
 
