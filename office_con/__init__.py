@@ -1,6 +1,6 @@
 """office-mcp -- Microsoft 365 / MS Graph logic layer with MCP server support."""
 
-__version__ = "0.1.0"
+__version__ = "0.1.7"
 
 from .web_user_instance import WebUserInstance
 from .db_user_instance import DBUserInstance
