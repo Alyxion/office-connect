@@ -2030,11 +2030,30 @@ def create_server(
         ),
     )
 
-    _state: dict[str, Any] = {"graph": None, "keyfile": keyfile}
+    _state: dict[str, Any] = {"graph": None, "keyfile": keyfile, "mtime": None}
 
     async def _get_graph() -> MsGraphInstance:
-        if _state["graph"] is None:
+        try:
+            current_mtime = os.path.getmtime(_state["keyfile"])
+        except OSError:
+            current_mtime = None
+
+        needs_reload = (
+            _state["graph"] is None
+            or (current_mtime is not None and current_mtime != _state["mtime"])
+        )
+        if needs_reload:
+            if _state["graph"] is not None:
+                print(
+                    f"[MCP] Keyfile changed on disk — reloading: {_state['keyfile']}",
+                    file=sys.stderr,
+                )
             _state["graph"] = await _create_graph(_state["keyfile"])
+            # Capture mtime AFTER _create_graph (which may rewrite on refresh)
+            try:
+                _state["mtime"] = os.path.getmtime(_state["keyfile"])
+            except OSError:
+                _state["mtime"] = None
         return _state["graph"]
 
     @mcp.list_tools()
@@ -2091,8 +2110,63 @@ async def main(
         await mcp.run(read_stream, write_stream, mcp.create_initialization_options())
 
 
+DEFAULT_KEYFILE = "~/.config/office-connect/token.json"
+
+
+def _cli_import_token(argv: list[str]) -> None:
+    """Copy a freshly-exported token JSON into the canonical keyfile location."""
+    parser = argparse.ArgumentParser(
+        prog="office-connect import-token",
+        description=(
+            "Import a freshly-exported token JSON into the canonical keyfile "
+            "location. Running MCP servers detect the file change on the next "
+            "tool call and reload — no client restart needed."
+        ),
+    )
+    parser.add_argument("src", help="Source token JSON (e.g. ~/Downloads/token_export.json)")
+    parser.add_argument(
+        "--dest",
+        default=DEFAULT_KEYFILE,
+        help="Destination keyfile path (default: %(default)s)",
+    )
+    args = parser.parse_args(argv)
+
+    src = Path(args.src).expanduser()
+    dest = Path(args.dest).expanduser()
+
+    if not src.is_file():
+        print(f"Error: source file not found: {src}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        data = json.loads(src.read_text())
+    except json.JSONDecodeError as exc:
+        print(f"Error: source is not valid JSON: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    required = {"access_token", "refresh_token", "client_id", "tenant_id"}
+    missing = required - set(data)
+    if missing:
+        print(
+            f"Error: source missing required fields: {sorted(missing)}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    _write_secure_json(str(dest), data)
+
+    email = data.get("email") or "(unknown)"
+    print(f"Token imported: {src} -> {dest}")
+    print(f"  email: {email}")
+    print("Running MCP servers will pick up the change on their next tool call.")
+
+
 def cli() -> None:
     """CLI entry point for the MCP server."""
+    if len(sys.argv) >= 2 and sys.argv[1] == "import-token":
+        return _cli_import_token(sys.argv[2:])
+
     parser = argparse.ArgumentParser(description="Office 365 MCP Server")
     parser.add_argument("--keyfile", required=True, help="Path to JSON token file")
     parser.add_argument(

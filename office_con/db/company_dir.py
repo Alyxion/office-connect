@@ -325,6 +325,13 @@ class LiveCompanyDirData:
         with self._lock:
             return self._user_by_email.get(email.lower())
 
+    async def get_graph_user_by_email_async(self, email: str):
+        """Return a live Graph user by email when this backend has a handler."""
+        handler = self._handler
+        if not handler:
+            return None
+        return await handler.get_user_by_email_async(email)
+
     def get_image_bytes(self, user_id: str) -> bytes | None:
         """Return cached photo blob or None."""
         return self._photo_blobs.get(user_id)
@@ -452,6 +459,13 @@ class CompanyDir:
         """Returns the raw image bytes for a user."""
         return self.data.get_image_bytes(user_id)
 
+    async def get_user_image_bytes_async(self, user_id: str) -> bytes | None:
+        """Return raw user image bytes, fetching from the live backend if needed."""
+        if self._live:
+            live: LiveCompanyDirData = self.data  # type: ignore[assignment]
+            return await live.get_image_bytes_async(user_id)
+        return self.data.get_image_bytes(user_id)
+
     def get_user_image_url(self, user_id: str, ext: str = '.jpg', *, width: int = 256, height: int = 256) -> str:
         if self.user_image_url_callback:
             return self.user_image_url_callback(user_id, ext, width=width, height=height)  # type: ignore[misc]
@@ -489,6 +503,13 @@ class CompanyDir:
         if self._live:
             return self.data.get_user_by_email(email)  # type: ignore[union-attr]
         return self._user_by_email.get(email.lower())
+
+    async def get_graph_user_by_email_async(self, email: str):
+        """Fallback to live Graph lookup for users not present in the local cache."""
+        if not self._live:
+            return None
+        live: LiveCompanyDirData = self.data  # type: ignore[assignment]
+        return await live.get_graph_user_by_email_async(email)
 
     def get_user_image(self, user_id: str, *, width: int = 256, height: int = 256) -> bytes:
         def resize_image(image_bytes: bytes, width: int, height: int) -> bytes:

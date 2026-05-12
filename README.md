@@ -52,6 +52,18 @@ office-connect --keyfile path/to/token.json
 
 Tokens are automatically refreshed on startup and persisted back to the file (`0600` permissions).
 
+### Refreshing an expired token without restarting the client
+
+When a refresh token expires (typically after the host application's session lifetime), export a fresh token JSON from your host app and drop it into the canonical keyfile location:
+
+```bash
+office-connect import-token ~/Downloads/token_export.json
+# default destination: ~/.config/office-connect/token.json
+# override with: --dest /custom/path/token.json
+```
+
+The destination is written with `0600` permissions. The MCP server compares the keyfile's `mtime` before each tool call; once the file changes, the next tool invocation rebuilds the Graph instance from the new contents — Claude Desktop, Cursor, etc. do **not** need to be restarted.
+
 ## Mock Transport
 
 A full mock layer for development and testing — no real O365 account needed.
