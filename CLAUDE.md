@@ -150,5 +150,5 @@ All fields in the config are optional. Tests for unconfigured features are skipp
 
 ## Relationship to Other Projects
 
-- **llming** (`/Users/michael/projects/llming`) — orchestrator for publishing
-- **llming-docs** (`/Users/michael/projects/llming-docs`) — contains the mail app at `apps/mail/` that consumes this library
+- **llming** — orchestrator for publishing
+- **llming-docs** — contains the mail app at `apps/mail/` that consumes this library
