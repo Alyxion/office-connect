@@ -4,11 +4,12 @@ from __future__ import annotations
 import logging
 import re
 import unicodedata
+import asyncio
 from collections import Counter
 import json
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
-from typing import Any, Dict, List, Tuple, TYPE_CHECKING
+from typing import Any, Awaitable, Callable, Dict, List, Tuple, TYPE_CHECKING
 
 from office_con.msgraph.directory_handler import DirectoryUser
 from .mcp_base import MsGraphMCPServer
@@ -26,10 +27,18 @@ class Office365MCPServer(MsGraphMCPServer):
     Outlook calendar, contacts, and scheduling via the existing handlers.
     """
 
-    def __init__(self, graph: "MsGraphInstance", *, photo_url_prefix: str = "/api/photo", company_dir: object = None) -> None:
+    def __init__(
+        self,
+        graph: "MsGraphInstance",
+        *,
+        photo_url_prefix: str = "/api/photo",
+        company_dir: object = None,
+        contact_enricher: Callable[[Any, Dict[str, Any]], Awaitable[dict[str, Any] | None]] | None = None,
+    ) -> None:
         super().__init__(graph)
         self._photo_url_prefix = photo_url_prefix
         self._company_dir = company_dir
+        self._contact_enricher = contact_enricher
 
     async def get_prompt_hints(self) -> list[str]:
         return [
@@ -56,8 +65,11 @@ class Office365MCPServer(MsGraphMCPServer):
             "- NEVER include a `photo` field — the UI loads photos automatically from the email.\n"
             "- Only `name` and `email` are required. Include ALL other non-empty fields from the search results.\n"
             "- Supported fields: name, email, department, title, phone, location, manager, "
-            "company, building, room, street, zip, city, country, joined, birthday.\n"
+            "company, building, floor, room, street, zip, city, country, joined, birthday, "
+            "map_shape, map_coords.\n"
             "- The `manager` field is hidden in the card but available for answering follow-up questions.\n"
+            "- The `map_shape` and `map_coords` fields are hidden in the card; include them exactly "
+            "when the search result contains them so the UI can highlight the person on the room map.\n"
             "- The UI renders these as interactive contact cards — plain text contact info will look broken.\n"
             "- Place your ```contact blocks inline in your response text, wherever you mention the person.",
 
@@ -70,6 +82,13 @@ class Office365MCPServer(MsGraphMCPServer):
             "- A text-based tree with indentation\n"
             "- Contact cards for key people\n\n"
             "First use People Search to find the person's email, then call Org Chart with that email.",
+
+            "## People Location\n"
+            "Use `o365_resolve_contact` when the user asks where a person sits, which building "
+            "or floor they are on, or asks to locate a colleague. The tool can return building "
+            "and floor in the same call as the profile search. For every people-location answer, "
+            "always include the resolved person's fenced `contact` block; do not answer only with "
+            "plain text or only by opening a map/tool.",
         ]
 
     async def get_client_renderers(self) -> list[dict[str, str]]:
@@ -140,6 +159,8 @@ class Office365MCPServer(MsGraphMCPServer):
                     - css:   str — (optional) extra inline CSS on the ``<a>`` tag
                     - domain: str — (optional) only show for emails ending with this
             extraCss: str — (optional) additional CSS rules appended to the base styles
+            i18n: dict — optional locale-specific UI labels/formats. Use language
+                prefixes as keys (``de``, ``en``, ...), plus ``default``.
             emailEnhancerDomains: list[str] — email domains to enhance inline (empty = disabled)
             contactApiPrefix: str — URL prefix for contact lookup API
         """
@@ -161,6 +182,16 @@ class Office365MCPServer(MsGraphMCPServer):
             "contactApiPrefix": "/api/contact",
             "photoApiPrefix": self._photo_url_prefix,
             "orgSvg": self._ORG_SVG,
+            "i18n": {
+                "default": {
+                    "floorFormats": {
+                        "default": "{floor}",
+                        "numeric": "floor {floor}",
+                        "ground": "ground floor",
+                        "groundValues": ["0", "ground floor"],
+                    },
+                },
+            },
         }
 
     @staticmethod
@@ -181,13 +212,16 @@ class Office365MCPServer(MsGraphMCPServer):
             "}"
             # Avatar image
             ".cv2-contact-chip-avatar {"
-            "  width: 44px; height: 44px; min-width: 44px;"
-            "  border-radius: 50%; object-fit: cover;"
+            "  width: 44px !important; height: 44px !important; min-width: 44px !important;"
+            "  aspect-ratio: 1 / 1; border-radius: 9999px !important;"
+            "  object-fit: cover; object-position: center; overflow: hidden;"
+            "  clip-path: circle(48%); transform: scale(1.08);"
             "}"
             # Initials fallback
             ".cv2-contact-chip-initials {"
-            "  width: 44px; height: 44px; min-width: 44px;"
-            "  border-radius: 50%; background: var(--chat-accent, #6366f1);"
+            "  width: 44px !important; height: 44px !important; min-width: 44px !important;"
+            "  aspect-ratio: 1 / 1; border-radius: 9999px !important;"
+            "  overflow: hidden; clip-path: circle(50%); background: var(--chat-accent, #6366f1);"
             "  color: #fff; display: flex; align-items: center;"
             "  justify-content: center; font-size: 15px; font-weight: 700;"
             "}"
@@ -218,11 +252,60 @@ class Office365MCPServer(MsGraphMCPServer):
             # Action icon button (shared base)
             ".cv2-contact-chip a.cv2-contact-chip-action {"
             "  display: inline-flex; align-items: center; justify-content: center;"
-            "  width: 26px; height: 26px; border-radius: 6px;"
+            "  width: 26px; height: 26px; border-radius: 50%;"
             "  text-decoration: none; opacity: 0.7; transition: opacity 0.15s;"
             "}"
             ".cv2-contact-chip a.cv2-contact-chip-action:hover { opacity: 1; }"
             ".cv2-contact-chip-action svg { width: 20px; height: 20px; }"
+            ".cv2-contact-rooms-action { cursor: default; }"
+            ".cv2-contact-rooms-action svg { stroke: #ef4444; }"
+            ".cv2-rooms-preview {"
+            "  position: fixed; z-index: 10020; display: none;"
+            "  width: min(38vw, calc((100vh - 120px) * 2575 / 3005), 420px);"
+            "  min-width: 280px;"
+            "  max-width: calc(100vw - 16px);"
+            "  background: var(--chat-surface, #fff); border: 1px solid var(--chat-border, #e5e7eb);"
+            "  border-radius: var(--chat-radius, 8px); padding: 8px;"
+            "  box-shadow: 0 12px 32px rgba(0,0,0,0.28);"
+            "}"
+            ".cv2-rooms-preview-map {"
+            "  position: relative; width: 100%; aspect-ratio: 2575 / 3005;"
+            "  overflow: hidden; border-radius: 6px; background: rgba(148,163,184,0.12);"
+            "}"
+            ".cv2-rooms-preview-map > img.cv2-rooms-preview-base, .cv2-rooms-preview-map > svg {"
+            "  position: absolute; inset: 0; width: 100%; height: 100%;"
+            "}"
+            ".cv2-rooms-preview-map > img.cv2-rooms-preview-base { object-fit: contain; }"
+            ".cv2-rooms-preview-map svg { pointer-events: none; }"
+            ".cv2-rooms-preview-highlight {"
+            "  fill: rgba(239,68,68,0.24); stroke: #ef4444; stroke-width: 7;"
+            "  vector-effect: non-scaling-stroke;"
+            "}"
+            ".cv2-rooms-preview-region {"
+            "  fill: rgba(239,68,68,0.16); stroke: #ef4444; stroke-width: 5;"
+            "  stroke-dasharray: 12 8; vector-effect: non-scaling-stroke;"
+            "}"
+            ".cv2-rooms-preview-marker {"
+            "  position: absolute; width: clamp(28px, 3.4vw, 38px);"
+            "  aspect-ratio: 161 / 256; pointer-events: none;"
+            "  transform: translate(var(--pin-translate-x, -58.35%), var(--pin-translate-y, -99.88%));"
+            "  filter: drop-shadow(0 2px 4px rgba(0,0,0,0.3));"
+            "}"
+            ".cv2-rooms-preview-marker-pin,"
+            ".cv2-rooms-preview-marker-photo { position: absolute; display: block; }"
+            ".cv2-rooms-preview-marker-photo {"
+            "  z-index: 1; width: 62%; aspect-ratio: 1;"
+            "  left: 51.4%; top: 29.9%; transform: translate(-50%, -50%);"
+            "  border-radius: 50%; object-fit: cover; background: #111827;"
+            "}"
+            ".cv2-rooms-preview-marker-pin {"
+            "  z-index: 2; inset: 0; width: 100%; height: 100%; object-fit: contain;"
+            "}"
+            ".cv2-rooms-preview-label {"
+            "  margin-top: 6px; font-size: 12px; font-weight: 650;"
+            "  color: var(--chat-text, #111827); white-space: nowrap;"
+            "  overflow: hidden; text-overflow: ellipsis;"
+            "}"
             # Details row (phone, location, company)
             ".cv2-contact-chip-details {"
             "  display: flex; flex-wrap: wrap; gap: 2px 10px;"
@@ -232,8 +315,9 @@ class Office365MCPServer(MsGraphMCPServer):
             ".cv2-contact-chip-details span {"
             "  display: inline-flex; align-items: center; gap: 3px;"
             "}"
-            ".cv2-contact-chip-details .material-icons {"
-            "  font-size: 13px; opacity: 0.7;"
+            ".cv2-contact-detail-icon {"
+            "  width: 15px; height: 15px; min-width: 15px; border-radius: 50%;"
+            "  opacity: 0.78; stroke: currentColor;"
             "}"
             # Org trigger icon
             ".cv2-org-trigger { cursor: pointer; }"
@@ -274,8 +358,9 @@ class Office365MCPServer(MsGraphMCPServer):
     @staticmethod
     def _contact_renderer_js(config: dict | None = None) -> str:
         import json as _json
+        from office_con.web.images import office_image_cache_client_script
         cfg_json = _json.dumps(config or {"emailHref": "mailto:{email}", "actions": []})
-        return """
+        return office_image_cache_client_script() + """
 (function(registry, lang) {
   var CFG = """ + cfg_json + """;
   function escHtml(s) {
@@ -295,15 +380,370 @@ class Office365MCPServer(MsGraphMCPServer):
       var val = line.substring(idx + 1).trim();
       if (val) data[key] = val;
     });
+    data.name = displayName(data.name || '');
     return data;
+  }
+  function displayName(name) {
+    name = (name || '').trim();
+    var parts = name.split(',');
+    if (parts.length === 2 && parts[0].trim() && parts[1].trim()) {
+      return parts[1].trim() + ' ' + parts[0].trim();
+    }
+    return name;
   }
   function tpl(template, email, name) {
     return template.replace(/\\{email\\}/g, encodeURIComponent(email))
                    .replace(/\\{name\\}/g, encodeURIComponent(name));
   }
+  function localeConfig() {
+    var code = String(CFG.locale || document.documentElement.lang || navigator.language || '').toLowerCase();
+    var cfg = CFG.i18n || {};
+    return cfg[code] || cfg[code.split('-')[0]] || cfg.default || {};
+  }
+  function applyTemplate(template, values) {
+    return String(template || '').replace(/\\{([a-zA-Z0-9_]+)\\}/g, function(_, key) {
+      return values[key] == null ? '' : String(values[key]);
+    });
+  }
+  function listValues(values) {
+    if (Array.isArray(values)) return values;
+    return String(values || '').split(',').map(function(v) { return v.trim(); }).filter(Boolean);
+  }
+  function formatFloor(floor) {
+    var raw = String(floor || '').trim();
+    if (!raw) return '';
+    var formats = localeConfig().floorFormats || {};
+    var template = formats.default || '{floor}';
+    var groundValues = listValues(formats.groundValues).map(function(v) { return v.toLowerCase(); });
+    if (groundValues.indexOf(raw.toLowerCase()) >= 0) {
+      template = formats.ground || template;
+    } else if (/^\\d+$/.test(raw)) {
+      template = formats.numeric || template;
+    } else {
+      return raw;
+    }
+    return applyTemplate(template, { floor: raw });
+  }
+  function detailIcon(name) {
+    if (name === 'phone') {
+      return '<svg class="cv2-contact-detail-icon" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1 1 .4 2 .7 2.9a2 2 0 0 1-.4 2.1L8.1 10a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.1-.4c.9.3 1.9.6 2.9.7A2 2 0 0 1 22 16.9z"/></svg>';
+    }
+    if (name === 'location') {
+      return '<svg class="cv2-contact-detail-icon" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 10c0 5-8 12-8 12S4 15 4 10a8 8 0 1 1 16 0z"/><circle cx="12" cy="10" r="3"/></svg>';
+    }
+    return '<svg class="cv2-contact-detail-icon" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 21h18"/><path d="M5 21V7l8-4v18"/><path d="M19 21V11l-6-4"/><path d="M9 9h.01"/><path d="M9 13h.01"/><path d="M9 17h.01"/></svg>';
+  }
   var _orgPopup = null;
   var _orgHideTimer = null;
   var _orgCache = {};
+  var _roomsPopup = null;
+  var _roomsHideTimer = null;
+  var _roomsLocationCache = null;
+
+  async function officePhotoByEmail(email, opts) {
+    if (!email || !window.OfficeImageCache) return '';
+    var options = opts || {};
+    options.prefix = options.prefix || CFG.photoApiPrefix || '/api/photo';
+    return window.OfficeImageCache.byEmail(email, options);
+  }
+
+  function parseJsonSafe(value) {
+    try { return JSON.parse(value || ''); } catch (e) { return null; }
+  }
+
+  function roomsLabel(data) {
+    var bits = [];
+    if (data.building || data.location) bits.push(data.building || data.location);
+    if (data.floor) bits.push(formatFloor(data.floor));
+    if (data.room) bits.push(data.room);
+    return bits.join(', ') || data.name || '';
+  }
+
+  function normLocationText(value) {
+    return String(value || '').trim().toLowerCase()
+      .normalize('NFKD').replace(/[\\u0300-\\u036f]/g, '')
+      .replace(/[._,-]+/g, ' ').replace(/\\s+/g, ' ');
+  }
+
+  function contactLocationCandidates(data) {
+    var out = [];
+    function add(value) {
+      var normalized = normLocationText(value);
+      if (normalized && out.indexOf(normalized) < 0) out.push(normalized);
+    }
+    add(data.email);
+    if (data.email && data.email.indexOf('@') > 0) add(data.email.split('@')[0]);
+    add(data.name);
+    var parts = String(data.name || '').trim().split(/\\s+/).filter(Boolean);
+    if (parts.length >= 2) {
+      add(parts[parts.length - 1] + ' ' + parts.slice(0, -1).join(' '));
+      add(parts[parts.length - 1] + ', ' + parts.slice(0, -1).join(' '));
+    }
+    return out;
+  }
+
+  function locSearchValues(loc) {
+    var meta = loc.meta || {};
+    return [
+      loc.key, loc.label,
+      meta.email, meta.mail, meta.user_email,
+      meta.display_name, meta.name
+    ].filter(Boolean).map(normLocationText);
+  }
+
+  function buildingLocationCandidates(data) {
+    var out = [];
+    function add(value) {
+      var normalized = normLocationText(value);
+      if (normalized && out.indexOf(normalized) < 0) out.push(normalized);
+      var match = normalized.match(/(?:building|gebaude|gebaeude|haus)\\s+([a-z0-9]+)/);
+      if (match && out.indexOf(match[1]) < 0) out.push(match[1]);
+      match = normalized.match(/\\b([a-z])\\b/);
+      if (match && out.indexOf(match[1]) < 0) out.push(match[1]);
+    }
+    add(data.building);
+    add(data.location);
+    return out;
+  }
+
+  function departmentLocationCandidates(data) {
+    var out = [];
+    function add(value) {
+      var normalized = normLocationText(value);
+      if (normalized && out.indexOf(normalized) < 0) out.push(normalized);
+    }
+    add(data.department);
+    String(data.department || '').replace(/[-_]/g, ' ').split(/\\s+/).forEach(add);
+    return out;
+  }
+
+  async function fetchRoomsLocations() {
+    if (_roomsLocationCache !== null) return _roomsLocationCache;
+    var rooms = CFG.rooms || {};
+    var api = rooms.locationsApi || '';
+    if (!api) { _roomsLocationCache = []; return _roomsLocationCache; }
+    try {
+      var resp = await fetch(api, { credentials: 'same-origin' });
+      if (!resp.ok) { _roomsLocationCache = []; return _roomsLocationCache; }
+      var body = await resp.json();
+      _roomsLocationCache = body.locations || [];
+      return _roomsLocationCache;
+    } catch (e) {
+      _roomsLocationCache = [];
+      return _roomsLocationCache;
+    }
+  }
+
+  async function resolveRoomsLocation(data) {
+    var embeddedCoords = parseJsonSafe(data.map_coords || data.mapCoords || '');
+    var embeddedShape = (data.map_shape || data.mapShape || '').toLowerCase();
+    if (embeddedCoords && embeddedShape) {
+      return {
+        shape: embeddedShape,
+        coords: embeddedCoords,
+        labelData: data,
+      };
+    }
+    var candidates = contactLocationCandidates(data);
+    if (!candidates.length) return null;
+    var locations = await fetchRoomsLocations();
+    var people = locations.filter(function(loc) { return loc.kind === 'person'; });
+    for (var i = 0; i < people.length; i++) {
+      var loc = people[i];
+      var values = locSearchValues(loc);
+      for (var c = 0; c < candidates.length; c++) {
+        if (values.indexOf(candidates[c]) >= 0) {
+          return {
+            shape: loc.shape,
+            coords: loc.coords,
+            labelData: {
+              name: loc.label || data.name,
+              building: loc.building || data.building || data.location,
+              floor: loc.floor != null ? loc.floor : data.floor,
+              room: loc.room || data.room,
+            },
+          };
+        }
+      }
+    }
+    for (var j = 0; j < people.length; j++) {
+      var loc2 = people[j];
+      var hay = locSearchValues(loc2).join(' ');
+      for (var k = 0; k < candidates.length; k++) {
+        var parts = candidates[k].split(' ').filter(Boolean);
+        if (parts.length >= 2 && parts.every(function(part) { return hay.indexOf(part) >= 0; })) {
+          return {
+            shape: loc2.shape,
+            coords: loc2.coords,
+            labelData: {
+              name: loc2.label || data.name,
+              building: loc2.building || data.building || data.location,
+              floor: loc2.floor != null ? loc2.floor : data.floor,
+              room: loc2.room || data.room,
+            },
+          };
+        }
+      }
+    }
+    var departmentCandidates = departmentLocationCandidates(data);
+    if (departmentCandidates.length) {
+      var departments = locations.filter(function(loc) { return loc.kind === 'department'; });
+      for (var d = 0; d < departments.length; d++) {
+        var dept = departments[d];
+        var deptValues = locSearchValues(dept);
+        for (var dc = 0; dc < departmentCandidates.length; dc++) {
+          var deptCandidate = departmentCandidates[dc];
+          if (deptValues.indexOf(deptCandidate) >= 0 ||
+              deptValues.some(function(value) { return value.indexOf(deptCandidate) >= 0; })) {
+            return {
+              shape: dept.shape,
+              coords: dept.coords,
+              labelData: {
+                name: dept.label || data.name,
+                building: dept.building || data.building || data.location,
+                floor: dept.floor != null ? dept.floor : data.floor,
+                room: data.room,
+              },
+            };
+          }
+        }
+      }
+    }
+    var buildingCandidates = buildingLocationCandidates(data);
+    if (buildingCandidates.length) {
+      var buildings = locations.filter(function(loc) { return loc.kind === 'building'; });
+      for (var b = 0; b < buildings.length; b++) {
+        var building = buildings[b];
+        var buildingValues = locSearchValues(building);
+        for (var bc = 0; bc < buildingCandidates.length; bc++) {
+          var candidate = buildingCandidates[bc];
+          if (buildingValues.indexOf(candidate) >= 0 ||
+              buildingValues.some(function(value) { return value.indexOf(candidate) >= 0; })) {
+            return {
+              shape: building.shape,
+              coords: building.coords,
+              approximate: true,
+              labelData: {
+                name: data.name,
+                building: building.label || data.building || data.location,
+                floor: data.floor,
+                room: data.room,
+              },
+            };
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  function roomsPath(shape, coords, approximate) {
+    if (!shape || !coords) return '';
+    var svgW = 1000;
+    var svgH = 1000;
+    var cls = approximate ? 'cv2-rooms-preview-region' : 'cv2-rooms-preview-highlight';
+    function n(v) { return Number(v || 0); }
+    if (shape === 'point') {
+      return '<circle class="' + cls + '" cx="' + (n(coords.x) * svgW).toFixed(2) +
+        '" cy="' + (n(coords.y) * svgH).toFixed(2) + '" r="' + (approximate ? '24' : '13') + '"/>';
+    }
+    if (shape === 'rectangle') {
+      return '<rect class="' + cls + '" x="' + (n(coords.x) * svgW).toFixed(2) +
+        '" y="' + (n(coords.y) * svgH).toFixed(2) + '" width="' + (n(coords.w) * svgW).toFixed(2) +
+        '" height="' + (n(coords.h) * svgH).toFixed(2) + '" rx="8"/>';
+    }
+    if (shape === 'ellipse') {
+      return '<ellipse class="' + cls + '" cx="' + (n(coords.cx) * svgW).toFixed(2) +
+        '" cy="' + (n(coords.cy) * svgH).toFixed(2) + '" rx="' + (n(coords.rx) * svgW).toFixed(2) +
+        '" ry="' + (n(coords.ry) * svgH).toFixed(2) + '"/>';
+    }
+    if (shape === 'polygon') {
+      var points = (coords.points || []).map(function(p) {
+        return (n(p[0]) * svgW).toFixed(2) + ',' + (n(p[1]) * svgH).toFixed(2);
+      }).join(' ');
+      if (!points) return '';
+      return '<polygon class="' + cls + '" points="' + escAttr(points) + '"/>';
+    }
+    return '';
+  }
+
+  function roomsPointMarker(shape, coords, data) {
+    var rooms = CFG.rooms || {};
+    var pinUrl = rooms.pinImageUrl || '/static/chat/media/location-pin-cropped.png';
+    if (!pinUrl || shape !== 'point' || !coords) return '';
+    function n(v) { return Number(v || 0); }
+    var left = (n(coords.x) * 100).toFixed(3);
+    var top = (n(coords.y) * 100).toFixed(3);
+    var anchorX = Number(rooms.pinAnchorX || 0.5835) * -100;
+    var anchorY = Number(rooms.pinAnchorY || 0.9988) * -100;
+    var photo = data.email
+      ? '<img class="cv2-rooms-preview-marker-photo" data-email="' + escAttr(data.email) + '" alt="">'
+      : '';
+    return '<div class="cv2-rooms-preview-marker" style="left:' + left + '%;top:' + top +
+      '%;--pin-translate-x:' + anchorX.toFixed(2) + '%;--pin-translate-y:' + anchorY.toFixed(2) + '%">' +
+      photo +
+      '<img class="cv2-rooms-preview-marker-pin" src="' + escAttr(pinUrl) + '" alt="">' +
+      '</div>';
+  }
+
+  function getRoomsPopup() {
+    if (_roomsPopup) return _roomsPopup;
+    _roomsPopup = document.createElement('div');
+    _roomsPopup.className = 'cv2-rooms-preview';
+    document.body.appendChild(_roomsPopup);
+    _roomsPopup.addEventListener('mouseenter', function() {
+      if (_roomsHideTimer) { clearTimeout(_roomsHideTimer); _roomsHideTimer = null; }
+    });
+    _roomsPopup.addEventListener('mouseleave', function() {
+      _roomsHideTimer = setTimeout(function() { _roomsPopup.style.display = 'none'; }, 160);
+    });
+    return _roomsPopup;
+  }
+
+  async function showRoomsPopup(el, data) {
+    var rooms = CFG.rooms || {};
+    if (!rooms.imageUrl) return;
+    var popup = getRoomsPopup();
+    popup.innerHTML = '<div class="cv2-rooms-preview-map">' +
+      '<img class="cv2-rooms-preview-base" src="' + escAttr(rooms.imageUrl) + '" alt="">' +
+      '<svg viewBox="0 0 1000 1000" preserveAspectRatio="none"></svg>' +
+      '<div class="cv2-rooms-preview-markers"></div>' +
+      '</div>';
+    popup.style.display = 'block';
+    var rect = el.getBoundingClientRect();
+    var popupRect = popup.getBoundingClientRect();
+    var left = rect.left;
+    var top = rect.bottom + 8;
+    if (left + popupRect.width > window.innerWidth - 8) left = window.innerWidth - popupRect.width - 8;
+    if (top + popupRect.height > window.innerHeight - 8) top = rect.top - popupRect.height - 8;
+    popup.style.left = Math.max(8, left) + 'px';
+    popup.style.top = Math.max(8, top) + 'px';
+    var resolved = await resolveRoomsLocation(data);
+    var marker = resolved ? roomsPointMarker(resolved.shape, resolved.coords, data) : '';
+    var path = resolved && !marker ? roomsPath(resolved.shape, resolved.coords, resolved.approximate) : '';
+    var labelData = resolved ? resolved.labelData : data;
+    var label = (path || marker) ? roomsLabel(labelData) : (rooms.noLocationLabel || '');
+    var svg = popup.querySelector('svg');
+    if (svg) svg.innerHTML = path;
+    var markers = popup.querySelector('.cv2-rooms-preview-markers');
+    if (markers) {
+      markers.innerHTML = marker;
+      markers.querySelectorAll('.cv2-rooms-preview-marker-photo[data-email]').forEach(function(img) {
+        officePhotoByEmail(img.dataset.email, { size: 64, realOnly: true }).then(function(url) {
+          if (url) img.src = url;
+          else img.remove();
+        }).catch(function() { img.remove(); });
+      });
+    }
+    var oldLabel = popup.querySelector('.cv2-rooms-preview-label');
+    if (oldLabel) oldLabel.remove();
+    if (label) {
+      var labelEl = document.createElement('div');
+      labelEl.className = 'cv2-rooms-preview-label';
+      labelEl.textContent = label;
+      popup.appendChild(labelEl);
+    }
+  }
 
   function getOrgPopup() {
     if (_orgPopup) return _orgPopup;
@@ -337,9 +777,8 @@ class Office365MCPServer(MsGraphMCPServer):
 
   function orgAvatar(person, size) {
     var ini = (person.name || '').split(/[\\s,]+/).map(function(w){return (w[0]||'')}).join('').substring(0,2).toUpperCase();
-    var photoUrl = person.email ? (CFG.photoApiPrefix || '/api/photo') + '/by-email/' + encodeURIComponent(person.email) : '';
     var iniHtml = '<div class="cv2-contact-chip-initials cv2-org-av-slot" style="width:'+size+'px;height:'+size+'px;min-width:'+size+'px;font-size:'+(size*0.4)+'px"' +
-      (photoUrl ? ' data-photo="' + escAttr(photoUrl) + '" data-sz="' + size + '"' : '') +
+      (person.email ? ' data-email="' + escAttr(person.email) + '" data-sz="' + size + '"' : '') +
       '>' + ini + '</div>';
     return iniHtml;
   }
@@ -374,16 +813,12 @@ class Office365MCPServer(MsGraphMCPServer):
   }
 
   function fixOrgAvatars(root) {
-    root.querySelectorAll('.cv2-org-av-slot[data-photo]').forEach(function(slot) {
-      var url = slot.dataset.photo;
+    root.querySelectorAll('.cv2-org-av-slot[data-email]').forEach(function(slot) {
+      var email = slot.dataset.email;
       var sz = slot.dataset.sz || 22;
-      if (!url) return;
-      fetch(url).then(function(r) {
-        if (!r.ok) return;
-        return r.blob();
-      }).then(function(blob) {
-        if (!blob) return;
-        var objUrl = URL.createObjectURL(blob);
+      if (!email) return;
+      officePhotoByEmail(email, { size: sz }).then(function(objUrl) {
+        if (!objUrl) return;
         var img = document.createElement('img');
         img.className = 'cv2-contact-chip-avatar';
         img.style.cssText = 'width:'+sz+'px;height:'+sz+'px;min-width:'+sz+'px';
@@ -418,7 +853,6 @@ class Office365MCPServer(MsGraphMCPServer):
 
       // Avatar — always fetch photo by email, server returns initials fallback if needed
       var avatar;
-      var avatarPhotoUrl = data.email ? (CFG.photoApiPrefix || '/api/photo') + '/by-email/' + encodeURIComponent(data.email) : null;
       avatar = '<div class="cv2-contact-chip-initials">' + initials + '</div>';
 
       // Info lines
@@ -427,11 +861,12 @@ class Office365MCPServer(MsGraphMCPServer):
 
       // Detail row: phone, location, company (small icons)
       var detailParts = [];
-      if (data.phone) detailParts.push('<span><span class="material-icons">phone</span>' + escHtml(data.phone) + '</span>');
+      if (data.phone) detailParts.push('<span>' + detailIcon('phone') + escHtml(data.phone) + '</span>');
       var loc = data.building || data.location || '';
-      if (loc) detailParts.push('<span><span class="material-icons">location_on</span>' + escHtml(loc) + '</span>');
-      else if (data.city) detailParts.push('<span><span class="material-icons">location_on</span>' + escHtml(data.city + (data.country ? ', ' + data.country : '')) + '</span>');
-      if (data.company) detailParts.push('<span><span class="material-icons">business</span>' + escHtml(data.company) + '</span>');
+      if (loc && data.floor) loc += ', ' + formatFloor(data.floor);
+      if (loc) detailParts.push('<span>' + detailIcon('location') + escHtml(loc) + '</span>');
+      else if (data.city) detailParts.push('<span>' + detailIcon('location') + escHtml(data.city + (data.country ? ', ' + data.country : '')) + '</span>');
+      if (data.company) detailParts.push('<span>' + detailIcon('company') + escHtml(data.company) + '</span>');
       var detailsHtml = detailParts.length ? '<div class="cv2-contact-chip-details">' + detailParts.join('') + '</div>' : '';
 
       // Links row: email + configurable actions
@@ -448,7 +883,15 @@ class Office365MCPServer(MsGraphMCPServer):
           var url = tpl(a.url, data.email, data.name);
           var content = a.svg || escHtml(a.text || '');
           var style = a.css ? ' style="' + escAttr(a.css) + '"' : '';
-          actions += '<a class="cv2-contact-chip-action" href="' + escAttr(url) + '" target="_blank" title="' + escAttr(a.label || '') + '"' + style + '>' + content + '</a>';
+          var kind = a.kind || '';
+          var cls = 'cv2-contact-chip-action' + (kind === 'rooms' ? ' cv2-contact-rooms-action' : '');
+          var attrs = kind === 'rooms' ? ' data-contact-action="rooms"' : '';
+          var target = kind === 'rooms' ? '' : ' target="_blank"';
+          var labelAttr = kind === 'rooms'
+            ? ' aria-label="' + escAttr(a.label || '') + '"'
+            : ' title="' + escAttr(a.label || '') + '"';
+          actions += '<a class="' + cls + '" href="' + escAttr(url) + '"' + target +
+            labelAttr + attrs + style + '>' + content + '</a>';
         });
 
         var actionsHtml = actions ? '<span class="cv2-contact-chip-actions">' + actions + '</span>' : '';
@@ -465,21 +908,50 @@ class Office365MCPServer(MsGraphMCPServer):
         '</div>';
 
       // Async photo load — only insert <img> if fetch succeeds (avoids 404 console noise)
-      if (avatarPhotoUrl) {
-        (function(url, chip) {
-          fetch(url).then(function(r) {
-            if (!r.ok) return;
-            return r.blob();
-          }).then(function(blob) {
-            if (!blob) return;
-            var objUrl = URL.createObjectURL(blob);
+      if (data.email) {
+        (function(email, chip) {
+          officePhotoByEmail(email, { size: 128 }).then(function(objUrl) {
+            if (!objUrl) return;
             var img = document.createElement('img');
             img.className = 'cv2-contact-chip-avatar';
+            img.alt = '';
             img.src = objUrl;
             var old = chip.querySelector('.cv2-contact-chip-initials');
             if (old) old.replaceWith(img);
           }).catch(function(){});
-        })(avatarPhotoUrl, container.querySelector('.cv2-contact-chip'));
+        })(data.email, container.querySelector('.cv2-contact-chip'));
+      }
+
+      // Async: fetch org data, only show org icon if manager or direct reports exist
+      var roomsEl = container.querySelector('[data-contact-action="rooms"]');
+      if (roomsEl) {
+        roomsEl.addEventListener('mouseenter', function() {
+          if (_roomsHideTimer) { clearTimeout(_roomsHideTimer); _roomsHideTimer = null; }
+          showRoomsPopup(roomsEl, data);
+        });
+        roomsEl.addEventListener('mouseleave', function() {
+          _roomsHideTimer = setTimeout(function() {
+            if (_roomsPopup) _roomsPopup.style.display = 'none';
+          }, 160);
+        });
+        roomsEl.addEventListener('click', function(e) {
+          var app = window.__chatApp;
+          if (app && app.appExtActivate) {
+            e.preventDefault();
+            e.stopPropagation();
+            try {
+              var url = new URL(roomsEl.getAttribute('href') || '?tool=rooms', window.location.href);
+              var query = url.searchParams.get('select') || url.searchParams.get('query') || url.searchParams.get('q') || '';
+              app._appExtActivationPayload = app._appExtActivationPayload || {};
+              app._appExtActivationPayload.rooms = { query: query };
+              app._appExtBoltMode = url.searchParams.get('mode') || 'viewer';
+              app.appExtActivate('rooms');
+            } catch (_) {
+              app.appExtActivate('rooms');
+            }
+          }
+          if (_roomsPopup) _roomsPopup.style.display = 'none';
+        });
       }
 
       // Async: fetch org data, only show org icon if manager or direct reports exist
@@ -490,7 +962,7 @@ class Office365MCPServer(MsGraphMCPServer):
           if (!actionsRow) return;
           var orgEl = document.createElement('span');
           orgEl.className = 'cv2-contact-chip-action cv2-org-trigger';
-          orgEl.title = 'Org Chart';
+          orgEl.setAttribute('aria-label', 'Org Chart');
           orgEl.innerHTML = CFG.orgSvg;
           actionsRow.appendChild(orgEl);
           orgEl.addEventListener('mouseenter', function() {
@@ -561,7 +1033,8 @@ class Office365MCPServer(MsGraphMCPServer):
             "  font-size: 16px; color: var(--chat-text-muted, #6b7280); opacity: 0.7; flex-shrink: 0;"
             "}"
             ".cv2-org-row img {"
-            "  border-radius: 50%; object-fit: cover; flex-shrink: 0;"
+            "  aspect-ratio: 1 / 1; border-radius: 9999px !important;"
+            "  object-fit: cover; overflow: hidden; clip-path: circle(50%); flex-shrink: 0;"
             "}"
             ".cv2-org-row small {"
             "  color: var(--chat-text-muted, #6b7280); font-size: 11px;"
@@ -576,7 +1049,8 @@ class Office365MCPServer(MsGraphMCPServer):
             "  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;"
             "}"
             ".cv2-org-report img, .cv2-org-report .cv2-contact-chip-initials {"
-            "  border-radius: 50%; object-fit: cover; flex-shrink: 0;"
+            "  aspect-ratio: 1 / 1; border-radius: 9999px !important;"
+            "  object-fit: cover; overflow: hidden; clip-path: circle(50%); flex-shrink: 0;"
             "}"
             ".cv2-org-report small { color: var(--chat-text-muted, #6b7280); font-size: 11px; }"
         )
@@ -584,12 +1058,14 @@ class Office365MCPServer(MsGraphMCPServer):
     @staticmethod
     def _email_inline_renderer_js(config: dict) -> str:
         import json as _json
+        from office_con.web.images import office_image_cache_client_script
         cfg_json = _json.dumps(config)
         # NOTE: This JS is evaluated via new Function('registry', js).
         # Backslashes in the Python triple-quoted string are interpreted once
         # by Python, producing the JS source text.  So Python '\\n' → JS '\n',
         # Python '\\\\' → JS '\\', Python '\\{' → JS '\{'.
         return (
+            office_image_cache_client_script() +
             "(function(registry) {\n"
             "var CFG = " + cfg_json + ";\n"
             r"""
@@ -605,9 +1081,44 @@ function escHtml(s) {
 function escAttr(s) {
   return (s || '').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
 }
+async function officePhotoByEmail(email, opts) {
+  if (!email || !window.OfficeImageCache) return '';
+  var options = opts || {};
+  options.prefix = options.prefix || CFG.photoApiPrefix || '/api/photo';
+  return window.OfficeImageCache.byEmail(email, options);
+}
 function tpl(template, email, name) {
   return template.replace(/\{email\}/g, encodeURIComponent(email))
                  .replace(/\{name\}/g, encodeURIComponent(name));
+}
+function localeConfig() {
+  var code = String(CFG.locale || document.documentElement.lang || navigator.language || '').toLowerCase();
+  var cfg = CFG.i18n || {};
+  return cfg[code] || cfg[code.split('-')[0]] || cfg.default || {};
+}
+function applyTemplate(template, values) {
+  return String(template || '').replace(/\{([a-zA-Z0-9_]+)\}/g, function(_, key) {
+    return values[key] == null ? '' : String(values[key]);
+  });
+}
+function listValues(values) {
+  if (Array.isArray(values)) return values;
+  return String(values || '').split(',').map(function(v) { return v.trim(); }).filter(Boolean);
+}
+function formatFloor(floor) {
+  var raw = String(floor || '').trim();
+  if (!raw) return '';
+  var formats = localeConfig().floorFormats || {};
+  var template = formats.default || '{floor}';
+  var groundValues = listValues(formats.groundValues).map(function(v) { return v.toLowerCase(); });
+  if (groundValues.indexOf(raw.toLowerCase()) >= 0) {
+    template = formats.ground || template;
+  } else if (/^\d+$/.test(raw)) {
+    template = formats.numeric || template;
+  } else {
+    return raw;
+  }
+  return applyTemplate(template, { floor: raw });
 }
 
 function getPopup() {
@@ -656,9 +1167,8 @@ function hasOrgData2(d) {
 
 function orgAvatar2(person, size) {
   var ini = (person.name || '').split(/[\s,]+/).map(function(w){return (w[0]||'')}).join('').substring(0,2).toUpperCase();
-  var photoUrl = person.email ? (CFG.photoApiPrefix || '/api/photo') + '/by-email/' + encodeURIComponent(person.email) : '';
   var iniHtml = '<div class="cv2-contact-chip-initials cv2-org-av-slot" style="width:'+size+'px;height:'+size+'px;min-width:'+size+'px;font-size:'+(size*0.4)+'px"' +
-    (photoUrl ? ' data-photo="' + escAttr(photoUrl) + '" data-sz="' + size + '"' : '') +
+    (person.email ? ' data-email="' + escAttr(person.email) + '" data-sz="' + size + '"' : '') +
     '>' + ini + '</div>';
   return iniHtml;
 }
@@ -693,16 +1203,12 @@ function buildOrgHtml2(data) {
 }
 
 function fixOrgAvatars2(root) {
-  root.querySelectorAll('.cv2-org-av-slot[data-photo]').forEach(function(slot) {
-    var url = slot.dataset.photo;
+  root.querySelectorAll('.cv2-org-av-slot[data-email]').forEach(function(slot) {
+    var email = slot.dataset.email;
     var sz = slot.dataset.sz || 22;
-    if (!url) return;
-    fetch(url).then(function(r) {
-      if (!r.ok) return;
-      return r.blob();
-    }).then(function(blob) {
-      if (!blob) return;
-      var objUrl = URL.createObjectURL(blob);
+    if (!email) return;
+    officePhotoByEmail(email, { size: sz }).then(function(objUrl) {
+      if (!objUrl) return;
       var img = document.createElement('img');
       img.className = 'cv2-contact-chip-avatar';
       img.style.cssText = 'width:'+sz+'px;height:'+sz+'px;min-width:'+sz+'px';
@@ -732,7 +1238,6 @@ function showPopup(el, data) {
   var initials = data.name.split(/[\s,]+/).map(function(w){return (w[0]||'')}).join('').substring(0,2).toUpperCase();
 
   var avatar = '<div class="cv2-contact-chip-initials">' + initials + '</div>';
-  var avatarPhotoUrl2 = data.email ? (CFG.photoApiPrefix || '/api/photo') + '/by-email/' + encodeURIComponent(data.email) : null;
 
   var titleHtml = data.title ? '<span class="cv2-contact-chip-title">' + escHtml(data.title) + '</span>' : '';
   var deptHtml = data.department ? '<span class="cv2-contact-chip-dept">' + escHtml(data.department) + '</span>' : '';
@@ -741,6 +1246,7 @@ function showPopup(el, data) {
   var detailParts = [];
   if (data.phone) detailParts.push('<span><span class="material-icons">phone</span>' + escHtml(data.phone) + '</span>');
   var loc = data.building || data.location || '';
+  if (loc && data.floor) loc += ', ' + formatFloor(data.floor);
   if (loc) detailParts.push('<span><span class="material-icons">location_on</span>' + escHtml(loc) + '</span>');
   else if (data.city) detailParts.push('<span><span class="material-icons">location_on</span>' + escHtml(data.city + (data.country ? ', ' + data.country : '')) + '</span>');
   if (data.company) detailParts.push('<span><span class="material-icons">business</span>' + escHtml(data.company) + '</span>');
@@ -757,12 +1263,16 @@ function showPopup(el, data) {
       var url = tpl(a.url, data.email, data.name);
       var content = a.svg || escHtml(a.text || '');
       var style = a.css ? ' style="' + escAttr(a.css) + '"' : '';
-      actions += '<a class="cv2-contact-chip-action" href="' + escAttr(url) + '" target="_blank" title="' + escAttr(a.label || '') + '"' + style + '>' + content + '</a>';
+      var kind = a.kind || '';
+      var labelAttr = kind === 'rooms'
+        ? ' aria-label="' + escAttr(a.label || '') + '"'
+        : ' title="' + escAttr(a.label || '') + '"';
+      actions += '<a class="cv2-contact-chip-action" href="' + escAttr(url) + '" target="_blank"' + labelAttr + style + '>' + content + '</a>';
     });
 
     // Org chart icon — shows manager + reports on hover (only if data exists)
     if (CFG.orgSvg && hasOrgData2(data)) {
-      actions += '<span class="cv2-contact-chip-action cv2-org-trigger-inline" title="Org Chart">' + CFG.orgSvg + '</span>';
+      actions += '<span class="cv2-contact-chip-action cv2-org-trigger-inline" aria-label="Org Chart">' + CFG.orgSvg + '</span>';
     }
 
     var actionsHtml = actions ? '<span class="cv2-contact-chip-actions">' + actions + '</span>' : '';
@@ -779,21 +1289,17 @@ function showPopup(el, data) {
     '</div>';
 
   // Async photo upgrade — only insert <img> if fetch succeeds
-  if (avatarPhotoUrl2) {
-    (function(url, chip) {
-      fetch(url).then(function(r) {
-        if (!r.ok) return;
-        return r.blob();
-      }).then(function(blob) {
-        if (!blob) return;
-        var objUrl = URL.createObjectURL(blob);
+  if (data.email) {
+    (function(email, chip) {
+      officePhotoByEmail(email, { size: 128 }).then(function(objUrl) {
+        if (!objUrl) return;
         var img = document.createElement('img');
         img.className = 'cv2-contact-chip-avatar';
         img.src = objUrl;
         var old = chip.querySelector('.cv2-contact-chip-initials');
         if (old) old.replaceWith(img);
       }).catch(function(){});
-    })(avatarPhotoUrl2, popup.querySelector('.cv2-contact-chip'));
+    })(data.email, popup.querySelector('.cv2-contact-chip'));
   }
 
   // Image error fallback -> initials
@@ -981,11 +1487,14 @@ registry.registerInline(async function(container) {
                     "Look up one or more people in the company directory by name. "
                     "Supports fuzzy matching — typos, umlaut variants (Sauter/Sautter, Mueller/Müller) "
                     "are handled automatically. Pass a single name or an array of names. "
-                    "Returns full name, email, department, job title, photo, and match score. "
+                    "Returns full name, email, department, job title, location/floor/building "
+                    "when known, and match score. "
                     "Results are grouped by search term when multiple names are given. "
                     "Use this whenever the user asks about colleagues, coworkers, or anyone who might "
                     "be in the organization — e.g. 'who is ...', 'find ...', 'look up ...', "
-                    "or when you need someone's email before scheduling."
+                    "'where is ...', 'where does ... sit', or when you need someone's email before "
+                    "scheduling. When answering a location question, include the returned contact "
+                    "data as a fenced contact block in the response."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -1447,6 +1956,17 @@ registry.registerInline(async function(container) {
         return max(token_avg, set_score)
 
     @staticmethod
+    def _display_name(u: "DirectoryUser") -> str:
+        """Return a user-facing name in first-name last-name order."""
+        if u.given_name and u.surname:
+            return f"{u.given_name} {u.surname}"
+        display_name = (u.display_name or "").strip()
+        parts = display_name.split(",")
+        if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+            return f"{parts[1].strip()} {parts[0].strip()}"
+        return display_name
+
+    @staticmethod
     def _format_user_details(u: "DirectoryUser", by_id: Dict[str, Any]) -> List[Tuple[str, str]]:
         """Return list of (label, value) pairs for all non-None user fields.
 
@@ -1499,6 +2019,38 @@ registry.registerInline(async function(container) {
                 guessed_names = [k for k, v in u.guessed_fields.items() if v]
                 if guessed_names:
                     details.append(("Guessed", ", ".join(guessed_names)))
+        return details
+
+    async def _contact_enrichment(self, user: Any, by_id: Dict[str, Any]) -> dict[str, Any]:
+        """Return host-provided contact enrichment for one directory user."""
+        if self._contact_enricher is None:
+            return {}
+        try:
+            enriched = await self._contact_enricher(user, by_id)
+        except Exception:
+            logger.exception("[Office365MCP] contact enrichment failed for %s", user.email)
+            return {}
+        return enriched or {}
+
+    @staticmethod
+    def _format_enrichment_details(enrichment: dict[str, Any]) -> List[Tuple[str, str]]:
+        """Format generic contact enrichment fields for human-readable output."""
+        details: List[Tuple[str, str]] = []
+        building = enrichment.get("building_label") or enrichment.get("building")
+        floor = enrichment.get("floor")
+        room = enrichment.get("room") or enrichment.get("room_name")
+        if building:
+            details.append(("Building", str(building)))
+        if floor is not None:
+            details.append(("Floor", str(floor)))
+        if room:
+            details.append(("Room", str(room)))
+        shape = enrichment.get("shape")
+        coords = enrichment.get("coords")
+        if shape:
+            details.append(("map_shape", str(shape)))
+        if coords:
+            details.append(("map_coords", json.dumps(coords, separators=(",", ":"))))
         return details
 
     # ── Main resolve logic ───────────────────────────────────────
@@ -1598,6 +2150,22 @@ registry.registerInline(async function(container) {
                 if u.id:
                     by_id[u.id] = u
 
+            enrichment_by_email: Dict[str, dict[str, Any]] = {}
+            enrich_targets = []
+            for _, scored in query_results:
+                for _, u in scored:
+                    if not u.email:
+                        continue
+                    email_key = u.email.lower()
+                    if email_key not in enrichment_by_email:
+                        enrichment_by_email[email_key] = {}
+                        enrich_targets.append((email_key, u))
+            enrich_results = await asyncio.gather(
+                *(self._contact_enrichment(u, by_id) for _, u in enrich_targets)
+            )
+            for (email_key, _), enriched in zip(enrich_targets, enrich_results):
+                enrichment_by_email[email_key] = enriched
+
             # 5. Format hierarchical output
             sections: List[str] = []
             total_matches = sum(len(scored) for _, scored in query_results)
@@ -1613,13 +2181,19 @@ registry.registerInline(async function(container) {
                     freq = email_counter.get(email_lower, 0)
                     match_label = "exact" if score >= 0.99 else f"fuzzy {score:.0%}"
 
-                    line = f"- **{u.display_name}**"
+                    display_name = self._display_name(u)
+                    line = f"- **{display_name}**"
                     if u.email:
                         line += f" <{u.email}>"
 
                     # Emit all non-None fields as pipe-separated details
                     detail_fields = self._format_user_details(u, by_id)
                     for label, val in detail_fields:
+                        line += f"  | {label}: {val}"
+                    enriched_fields = self._format_enrichment_details(
+                        enrichment_by_email.get(email_lower, {})
+                    )
+                    for label, val in enriched_fields:
                         line += f"  | {label}: {val}"
 
                     line += f"  | {freq} meetings (90d)"

@@ -15,6 +15,11 @@ from .msgraph.files_handler import FilesHandler
 from .msgraph.mcp_base import InProcessMCPServer, MsGraphMCPServer
 from .msgraph.office365_server import Office365MCPServer
 from .db import CompanyDir, CompanyDirBuilder
+from .web import (
+    OfficeImageCacheConfig,
+    create_company_image_router,
+    office_image_cache_client_script,
+)
 
 __all__ = [
     # Session layer
@@ -42,4 +47,8 @@ __all__ = [
     # Company directory
     "CompanyDir",
     "CompanyDirBuilder",
+    # Web helpers
+    "OfficeImageCacheConfig",
+    "create_company_image_router",
+    "office_image_cache_client_script",
 ]

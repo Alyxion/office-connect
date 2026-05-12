@@ -32,7 +32,19 @@ MsGraphInstance (inherits WebUserInstance)
 
 ### MCP Server (`office_con/mcp_server.py`)
 
-Stdio-based, 22 tools. Entry: `office-connect --keyfile path/to/token.json`. Defers graph creation to first tool call. Auto-refreshes tokens and persists back to keyfile.
+Stdio-based. Entry: `office-connect --keyfile path/to/token.json`. Defers graph creation to first tool call. Auto-refreshes tokens and persists back to keyfile.
+
+**Hot keyfile reload.** Before each tool call, the server compares `mtime(keyfile)` against the value captured when the cached graph was built; if it changed, the graph is rebuilt from the new file contents. Clients (Claude Desktop, etc.) do not need to restart after a token refresh.
+
+**Refreshing the keyfile in place.** Use the bundled subcommand to drop a freshly-exported token JSON into the canonical location (`~/.config/office-connect/token.json` by default) with secure 0600 permissions:
+
+```bash
+office-connect import-token ~/Downloads/token_export.json
+# or with a custom destination:
+office-connect import-token ~/Downloads/token_export.json --dest /etc/office-connect/token.json
+```
+
+The subcommand validates the source JSON (must contain `access_token`, `refresh_token`, `client_id`, `tenant_id`) and writes atomically. Any running MCP server pointed at the destination picks up the new token on its next tool invocation — no client restart needed.
 
 ### Mock System (`office_con/testing/`)
 
@@ -96,9 +108,44 @@ poetry run pytest tests/ -v    # integration tests skip without token file
 poetry run ruff check
 ```
 
+## Testing
+
+### Mock Tests (no credentials needed)
+
+```bash
+poetry run pytest tests/test_new_handlers.py -v
+```
+
+Runs against synthetic mock data — covers all handlers (Presence, Tasks, People, Places, MailboxSettings, OnlineMeetings, etc.).
+
+### Integration Tests (real MS Graph)
+
+To run tests against a real Microsoft 365 account:
+
+1. Export a token from a host application (e.g. via an admin token-export endpoint)
+2. Create `tests/test_config.json`:
+
+```json
+{
+    "token_file": "~/Downloads/token_export.json",
+    "expected_rooms": ["Chicago", "Paris"],
+    "expected_teams": ["My Team Name"],
+    "expected_presence_users": ["colleague@example.com"]
+}
+```
+
+3. Run:
+
+```bash
+poetry run pytest tests/test_integration_handlers.py -v -s
+```
+
+All fields in the config are optional. Tests for unconfigured features are skipped. The config file is gitignored.
+
 ## Sensitive Files (gitignored)
 
 - `tests/msgraph_test_token.json` — OAuth tokens for integration tests
+- `tests/test_config.json` — integration test configuration (user-specific)
 - `.env` — if present
 
 ## Relationship to Other Projects

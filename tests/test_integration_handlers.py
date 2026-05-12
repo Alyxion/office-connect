@@ -5,7 +5,7 @@ Configure by creating ``tests/test_config.json``::
 
     {
         "token_file": "~/Downloads/token_export.json",
-        "expected_rooms": ["Metzingen", "Chicago"],
+        "expected_rooms": ["Berlin", "Chicago"],
         "expected_teams": ["My Team"],
         "expected_presence_users": ["colleague@example.com"]
     }

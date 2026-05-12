@@ -131,6 +131,46 @@ class DirectoryHandler:
         async with self._alock:
             return await self._fetch_all_users_async()
 
+    async def get_user_by_email_async(self, email: str) -> DirectoryUser | None:
+        """Return a single directory user by mail or UPN."""
+        normalized = email.strip().lower()
+        if not normalized:
+            return None
+        token = await self.msg.get_access_token_async()
+        if not token:
+            return None
+
+        escaped = normalized.replace("'", "''")
+        url = (
+            f"{self.msg.msg_endpoint}users"
+            f"?$top=1"
+            f"&$select={self._SELECT_FIELDS}"
+            f"&$expand={self._EXPAND_MANAGER}"
+            f"&$filter=mail eq '{escaped}' or userPrincipalName eq '{escaped}'"
+        )
+        rsp = await self.msg.run_async(url=url, token=token)
+        if rsp is None or rsp.status_code != 200:
+            return None
+
+        values = rsp.json().get("value", [])
+        if not values:
+            return None
+        u = values[0]
+        mgr = u.get("manager") or {}
+        return DirectoryUser(
+            id=u["id"],
+            display_name=u.get("displayName"),
+            email=u.get("mail") or u.get("userPrincipalName"),
+            job_title=u.get("jobTitle"),
+            department=u.get("department"),
+            manager_id=mgr.get("id"),
+            account_enabled=u.get("accountEnabled"),
+            surname=u.get("surname"),
+            given_name=u.get("givenName"),
+            office_location=u.get("officeLocation"),
+            mobile_phone=u.get("mobilePhone"),
+        )
+
     async def get_user_manager_async(self, user_id: str) -> Optional[Dict]:
         token = await self.msg.get_access_token_async()
         if not token:
