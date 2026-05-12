@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "office-connect"
 version = "0.1.7"
-description = "Python library and MCP server for Microsoft 365 via Microsoft Graph"
+description = "Microsoft 365 superpowers for Python and AI agents"
 authors = ["Michael Ikemann"]
 license = "MIT"
 packages = [{include = "office_con"}]

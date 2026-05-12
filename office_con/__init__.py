@@ -1,4 +1,4 @@
-"""office-connect — Python library and MCP server for Microsoft 365 via Microsoft Graph."""
+"""office-connect — Microsoft 365 superpowers for Python and AI agents."""
 
 __version__ = "0.1.7"
 
