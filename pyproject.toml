@@ -4,6 +4,36 @@ version = "0.1.7"
 description = "Microsoft 365 superpowers for Python and AI agents"
 authors = ["Michael Ikemann"]
 license = "MIT"
+readme = "README.md"
+homepage = "https://github.com/Alyxion/office-connect"
+repository = "https://github.com/Alyxion/office-connect"
+documentation = "https://github.com/Alyxion/office-connect#readme"
+keywords = [
+    "microsoft-365",
+    "microsoft-graph",
+    "msgraph",
+    "office365",
+    "outlook",
+    "teams",
+    "onedrive",
+    "sharepoint",
+    "mcp",
+    "model-context-protocol",
+    "ai-agents",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Communications :: Email",
+    "Topic :: Office/Business",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
 packages = [{include = "office_con"}]
 
 [tool.poetry.dependencies]
