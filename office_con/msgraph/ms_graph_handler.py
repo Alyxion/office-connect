@@ -1,3 +1,4 @@
+import asyncio
 import os
 import logging
 import time as _time
@@ -51,6 +52,9 @@ class MsGraphInstance(WebUserInstance):
         self._calendar_handler: Optional[CalendarHandler] = None
         self.me: Optional[UserProfile] = None
         self.can_refresh = can_refresh
+        # Serializes refresh attempts so concurrent tool calls don't burn
+        # multiple refresh_tokens at once (Microsoft rotates them).
+        self._refresh_lock = asyncio.Lock()
         self.features = {WebUserInstance.FEATURE_MAIL, WebUserInstance.FEATURE_CALENDAR, WebUserInstance.FEATURE_PROFILE}
 
         self.auth_kwargs = {}
@@ -94,6 +98,54 @@ class MsGraphInstance(WebUserInstance):
         await self.set_access_token_async(result["access_token"])
         await self.set_refresh_token_async(result.get("refresh_token"))
         return result["access_token"]
+
+    async def get_access_token_async(self):
+        """Return a valid access token, refreshing proactively if it's about
+        to expire. Falls back to the parent implementation on a non-refreshable
+        instance or when no refresh token is available."""
+        token = await super().get_access_token_async()
+        if (
+            not token
+            or not self.can_refresh
+            or self.time_until_token_expiration(token) > self.min_expiry
+        ):
+            return token
+
+        async with self._refresh_lock:
+            # Re-check inside the lock — a concurrent caller may already have
+            # refreshed.
+            current = self.cache_dict.get("access_token")
+            if current and self.time_until_token_expiration(current) > self.min_expiry:
+                return current
+            refreshed = await self.refresh_token_async()
+            return refreshed or token
+
+    async def run_async(self, *, url, method="GET", json=None, token=None, add_headers=None):
+        """Send a Graph request. Retries once after a refresh if the server
+        rejects the cached token with 401."""
+        if token is None:
+            token = await self.get_access_token_async()
+
+        response = await super().run_async(
+            url=url, method=method, json=json, token=token, add_headers=add_headers,
+        )
+
+        if (
+            response is None
+            or getattr(response, "status_code", 0) != 401
+            or not self.can_refresh
+        ):
+            return response
+
+        async with self._refresh_lock:
+            new_token = await self.refresh_token_async()
+        if not new_token or new_token == token:
+            return response
+
+        logger.info("[OP] run_async — refreshed after 401, retrying %s", url[:80])
+        return await super().run_async(
+            url=url, method=method, json=json, token=new_token, add_headers=add_headers,
+        )
 
     async def acquire_token_async(self, code, redirect_url: str):
         _pid = os.getpid()
