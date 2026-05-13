@@ -103,20 +103,35 @@ async def _create_graph(keyfile: str) -> MsGraphInstance:
     if data.get("refresh_token"):
         inst.cache_dict["refresh_token"] = data["refresh_token"]
 
-    # Try refreshing the token
-    try:
-        refreshed = await inst.refresh_token_async()
-        if refreshed:
-            inst.cache_dict["access_token"] = refreshed
-            # Persist refreshed tokens back to the keyfile
-            data["access_token"] = refreshed
+    # Wrap refresh_token_async so any mid-session refresh (proactive expiry
+    # check in get_access_token_async, or reactive 401 retry in run_async)
+    # also writes the new tokens back to the keyfile. Without this, the
+    # in-memory tokens drift away from the on-disk source-of-truth and a
+    # process restart would reload stale credentials.
+    _original_refresh = inst.refresh_token_async
+
+    async def _refresh_and_persist() -> str | None:
+        new_token = await _original_refresh()
+        if new_token:
+            data["access_token"] = new_token
             new_refresh = inst.cache_dict.get("refresh_token")
             if new_refresh:
                 data["refresh_token"] = new_refresh
-            _write_secure_json(keyfile, data)
+            try:
+                await asyncio.to_thread(_write_secure_json, keyfile, data)
+            except Exception:
+                logger.exception("[MCP] failed to persist refreshed tokens to %s", keyfile)
+        return new_token
+
+    inst.refresh_token_async = _refresh_and_persist  # type: ignore[assignment]
+
+    # Initial refresh — auto-persists via the wrapper.
+    try:
+        await inst.refresh_token_async()
     except Exception:
-        pass
-    # Ensure we still have a token
+        logger.exception("[MCP] initial token refresh failed")
+
+    # Ensure we still have a token to use.
     if not inst.cache_dict.get("access_token"):
         inst.cache_dict["access_token"] = data["access_token"]
 
