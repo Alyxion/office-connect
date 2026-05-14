@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "office-connect"
-version = "0.1.7"
+version = "0.1.8"
 description = "Microsoft 365 superpowers for Python and AI agents"
 authors = ["Michael Ikemann"]
 license = "MIT"
