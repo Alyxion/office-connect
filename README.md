@@ -50,19 +50,39 @@ office-connect --keyfile path/to/token.json
 }
 ```
 
-Tokens are automatically refreshed on startup and persisted back to the file (`0600` permissions).
+Tokens are automatically refreshed (proactively when within 15 min of expiry, reactively on a 401 from Graph) and persisted back to the file (`0600` permissions).
 
-### Refreshing an expired token without restarting the client
+### Signing in for the first time (`office-connect login`)
 
-When a refresh token expires (typically after the host application's session lifetime), export a fresh token JSON from your host app and drop it into the canonical keyfile location:
+When you don't have any tokens yet, use the device-code login. The first run takes your Azure AD app credentials; every subsequent re-auth needs no arguments because the credentials are persisted in the keyfile.
+
+```bash
+# Cold start — supply the Azure AD app once
+office-connect login --client-id <APP_ID> --tenant-id <TENANT_ID> [--client-secret <SECRET>]
+
+# Already-configured keyfile — re-auth with no args
+office-connect login
+
+# Narrow scopes (default is all eight groups)
+office-connect login --scope mail --scope calendar
+```
+
+`office-connect login` prints a `microsoft.com/devicelogin` URL plus a short code, blocks polling Microsoft until you finish signing in, and writes the canonical keyfile (`~/.config/office-connect/token.json` by default, override with `--keyfile`). Available scope groups: `profile`, `directory`, `mail`, `calendar`, `chat`, `teams`, `drive`, `tasks`.
+
+> Your Azure AD app registration must have **"Allow public client flows"** enabled in its authentication manifest for device-code flow to work.
+
+### Refreshing tokens during a running session
+
+You don't have to. The MCP keeps tokens fresh on its own — within a session via in-process refresh, across restarts via the keyfile. Manual top-ups only matter if even the refresh token has been invalidated (typically after ~90 days of inactivity, or by tenant policy).
+
+If a host application exports tokens through an admin endpoint, drop the exported JSON at the canonical keyfile location with:
 
 ```bash
 office-connect import-token ~/Downloads/token_export.json
-# default destination: ~/.config/office-connect/token.json
-# override with: --dest /custom/path/token.json
+# override destination with --dest /custom/path/token.json
 ```
 
-The destination is written with `0600` permissions. The MCP server compares the keyfile's `mtime` before each tool call; once the file changes, the next tool invocation rebuilds the Graph instance from the new contents — Claude Desktop, Cursor, etc. do **not** need to be restarted.
+Both `login` and `import-token` write atomically with `0600` permissions. The MCP server compares the keyfile's `mtime` before each tool call; once the file changes, the next tool invocation rebuilds the Graph instance from the new contents — Claude Desktop, Cursor, etc. do **not** need to be restarted.
 
 ## Mock Transport
 

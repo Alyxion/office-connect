@@ -36,7 +36,21 @@ Stdio-based. Entry: `office-connect --keyfile path/to/token.json`. Defers graph 
 
 **Hot keyfile reload.** Before each tool call, the server compares `mtime(keyfile)` against the value captured when the cached graph was built; if it changed, the graph is rebuilt from the new file contents. Clients (Claude Desktop, etc.) do not need to restart after a token refresh.
 
-**Refreshing the keyfile in place.** Use the bundled subcommand to drop a freshly-exported token JSON into the canonical location (`~/.config/office-connect/token.json` by default) with secure 0600 permissions:
+**Self-healing token refresh.** During a session the MCP refreshes the access token automatically: `MsGraphInstance.get_access_token_async` runs a proactive refresh when the cached token has under 15 minutes of life left, and `run_async` does a reactive refresh-and-retry on a 401 from Graph. Every successful in-process refresh is written back to the keyfile (`_create_graph` wraps `refresh_token_async` with a persister), so a process restart never loads stale credentials.
+
+**Fresh sign-in via the CLI.** When you have neither an access nor a refresh token (truly cold start), use the device-code login:
+
+```bash
+# First time — pass the Azure AD app credentials once
+office-connect login --client-id <APP_ID> --tenant-id <TENANT_ID> [--client-secret <SECRET>]
+
+# Subsequent re-auths — credentials are persisted in the keyfile
+office-connect login
+```
+
+The flow prints a microsoft.com/devicelogin URL and short code, blocks polling, then writes the keyfile (default `~/.config/office-connect/token.json`, 0600). All eight scope groups are requested by default; narrow with repeatable `--scope` (`profile`, `directory`, `mail`, `calendar`, `chat`, `teams`, `drive`, `tasks`). The Azure AD app must have **"Allow public client flows"** enabled in its manifest.
+
+**Updating the keyfile from an externally-exported token.** Some host applications offer an admin "Export Token" endpoint. To install the exported JSON at the canonical location:
 
 ```bash
 office-connect import-token ~/Downloads/token_export.json
@@ -44,7 +58,7 @@ office-connect import-token ~/Downloads/token_export.json
 office-connect import-token ~/Downloads/token_export.json --dest /etc/office-connect/token.json
 ```
 
-The subcommand validates the source JSON (must contain `access_token`, `refresh_token`, `client_id`, `tenant_id`) and writes atomically. Any running MCP server pointed at the destination picks up the new token on its next tool invocation — no client restart needed.
+Both `login` and `import-token` write atomically with 0600 perms. Any running MCP server pointed at the destination picks up the new token on its next tool invocation — no client restart needed (mtime-watched).
 
 ### Mock System (`office_con/testing/`)
 
@@ -107,6 +121,31 @@ poetry install
 poetry run pytest tests/ -v    # integration tests skip without token file
 poetry run ruff check
 ```
+
+## Publishing to PyPI
+
+The package is published as [`office-connect`](https://pypi.org/project/office-connect/) on PyPI. The repo's owner has a PyPI API token stored in `~/.pypirc` (used by Poetry transparently).
+
+To cut a release:
+
+1. **Bump version in two places** (must stay in sync):
+   - `pyproject.toml` → `version = "X.Y.Z"`
+   - `office_con/__init__.py` → `__version__ = "X.Y.Z"`
+2. **Commit and push to git first** so the GitHub `main` matches what PyPI will serve:
+   ```bash
+   git add pyproject.toml office_con/__init__.py
+   git commit -m "Bump version to X.Y.Z"
+   git push origin main
+   ```
+3. **Build artifacts and publish**:
+   ```bash
+   rm -rf dist/
+   poetry publish --build
+   ```
+   `--build` produces both wheel + sdist into `dist/` and uploads them. The `readme`, `classifiers`, `keywords`, and `repository` fields from `pyproject.toml` populate the PyPI listing — keep those current.
+4. **Verify**: `curl -sS https://pypi.org/pypi/office-connect/json | jq .info.version` should report the new version within ~30s of upload (the JSON cache lags the simple index slightly).
+
+PyPI versions are immutable — once `X.Y.Z` is published it cannot be reused; bump again. If a parent project vendors this repo, mirror the bump there too via its sync script.
 
 ## Testing
 
