@@ -91,6 +91,30 @@ office-connect import-token ~/Downloads/token_export.json
 
 Both `login` and `import-token` write atomically with `0600` permissions. The MCP server compares the keyfile's `mtime` before each tool call; once the file changes, the next tool invocation rebuilds the Graph instance from the new contents — Claude Desktop, Cursor, etc. do **not** need to be restarted.
 
+### Permission tiers — what Claude is allowed to do
+
+Three tiers, from most to least restrictive:
+
+| tier | what it allows |
+|---|---|
+| `read_only` | list/get/search/peek — no mutation of Microsoft 365 state |
+| `drafts` *(default)* | everything `read_only` does, plus creating and updating *draft* emails. No sending. |
+| `all` | everything `drafts` does, plus sending mail, moving/deleting mail, flagging read, creating calendar events |
+
+Three places can set the tier — **the most restrictive of the ones that are set wins**:
+
+1. **MCP launcher CLI flag:** `--permission-level read_only|drafts|all` in the args list passed by Claude Desktop / Cursor / etc.
+2. **Environment variable:** `OFFICE_CONNECT_PERMISSION_LEVEL=read_only`
+3. **Global policy file:** a JSON object at `~/.config/office-connect/policy.json` (overridable via `--policy-file PATH` or `$OFFICE_CONNECT_POLICY`):
+
+   ```json
+   { "permission_level": "drafts" }
+   ```
+
+The policy file acts as a host-wide ceiling: regardless of how any individual MCP launcher is configured, the resolver clamps the effective tier down to the most restrictive value found. A launcher can always tighten further on top.
+
+Tools above the effective tier are removed from `list_tools` *and* refused by `call_tool` (defense in depth, fail-closed for unknown tool names).
+
 ## Mock Transport
 
 A full mock layer for development and testing — no real O365 account needed.
