@@ -44,11 +44,18 @@ Stdio-based. Entry: `office-connect --keyfile path/to/token.json`. Defers graph 
 # First time — pass the Azure AD app credentials once
 office-connect login --client-id <APP_ID> --tenant-id <TENANT_ID> [--client-secret <SECRET>]
 
-# Subsequent re-auths — credentials are persisted in the keyfile
+# Subsequent re-auths — zero arguments, credentials come from the saved config
 office-connect login
 ```
 
-The flow prints a microsoft.com/devicelogin URL and short code, blocks polling, then writes the keyfile (default `~/.config/office-connect/token.json`, 0600). All eight scope groups are requested by default; narrow with repeatable `--scope` (`profile`, `directory`, `mail`, `calendar`, `chat`, `teams`, `drive`, `tasks`). The Azure AD app must have **"Allow public client flows"** enabled in its manifest.
+The flow prints a microsoft.com/devicelogin URL and short code, blocks polling, writes the keyfile (default `~/.config/office-connect/token.json`, 0600), **and** saves the Azure AD app credentials to a separate app-config file (`~/.config/office-connect/config.json`, 0600). From then on, plain `office-connect login` resolves credentials in this order:
+
+1. CLI args (`--client-id` / `--tenant-id` / `--client-secret`)
+2. Values already in the keyfile (back-compat with existing setups)
+3. Env vars (`O365_CLIENT_ID` / `O365_TENANT_ID` / `O365_CLIENT_SECRET`)
+4. App-config file (overridable with `--app-config PATH` or `$OFFICE_CONNECT_APP_CONFIG`)
+
+You can also pre-create the app-config file by hand (it's just `{"client_id": "...", "tenant_id": "...", "client_secret": "..."}`). All eight scope groups are requested by default; narrow with repeatable `--scope` (`profile`, `directory`, `mail`, `calendar`, `chat`, `teams`, `drive`, `tasks`). The Azure AD app must have **"Allow public client flows"** enabled in its manifest.
 
 **Updating the keyfile from an externally-exported token.** Some host applications offer an admin "Export Token" endpoint. To install the exported JSON at the canonical location:
 
