@@ -2177,10 +2177,187 @@ def _cli_import_token(argv: list[str]) -> None:
     print("Running MCP servers will pick up the change on their next tool call.")
 
 
+_LOGIN_SCOPE_GROUPS: dict[str, str] = {
+    # Name → attribute on OfficeUserInstance carrying a list of Graph scopes.
+    "profile":   "PROFILE_SCOPE",
+    "directory": "DIRECTORY_SCOPE",
+    "mail":      "MAIL_SCOPE",
+    "calendar":  "CALENDAR_SCOPE",
+    "chat":      "CHAT_SCOPE",
+    "teams":     "TEAMS_SCOPE",
+    "drive":     "ONE_DRIVE_SCOPE",
+    "tasks":     "TASKS_SCOPE",
+}
+
+
+def _resolve_login_scopes(group_names: list[str] | None) -> list[str]:
+    """Expand named scope groups to the underlying Graph permission strings."""
+    from office_con.auth.office_user_instance import OfficeUserInstance
+
+    groups = group_names or list(_LOGIN_SCOPE_GROUPS.keys())
+    scopes: list[str] = []
+    for name in groups:
+        attr = _LOGIN_SCOPE_GROUPS.get(name)
+        if not attr:
+            raise ValueError(
+                f"unknown scope group {name!r}; "
+                f"valid: {sorted(_LOGIN_SCOPE_GROUPS)}"
+            )
+        for scope in getattr(OfficeUserInstance, attr):
+            if scope not in scopes:
+                scopes.append(scope)
+    return scopes
+
+
+def _cli_login(argv: list[str]) -> None:
+    """Interactive OAuth login via device-code flow; writes/updates a keyfile.
+
+    First run: pass --client-id/--tenant-id (and --client-secret if your app
+    requires it). The credentials are persisted into the keyfile so subsequent
+    re-auths only need ``office-connect login`` with no arguments.
+    """
+    parser = argparse.ArgumentParser(
+        prog="office-connect login",
+        description=(
+            "Sign in to Microsoft 365 via the OAuth 2.0 device-code flow and "
+            "write the resulting access/refresh tokens to the keyfile. After "
+            "the first successful login, client_id/tenant_id are persisted in "
+            "the keyfile so re-auth needs no arguments."
+        ),
+    )
+    parser.add_argument(
+        "--keyfile",
+        default=DEFAULT_KEYFILE,
+        help="Keyfile path. Read for stored credentials, written on success "
+             "(default: %(default)s).",
+    )
+    parser.add_argument("--client-id", default=None,
+                        help="Azure AD application (client) ID. Falls back to the "
+                             "value in the keyfile, then $O365_CLIENT_ID.")
+    parser.add_argument("--tenant-id", default=None,
+                        help="Tenant ID (or 'common'). Falls back to the keyfile, "
+                             "then $O365_TENANT_ID, then 'common'.")
+    parser.add_argument("--client-secret", default=None,
+                        help="Optional client secret. Stored in the keyfile so "
+                             "the refresh flow can use it. Falls back to the "
+                             "keyfile, then $O365_CLIENT_SECRET.")
+    parser.add_argument(
+        "--scope",
+        action="append",
+        dest="scope_groups",
+        choices=sorted(_LOGIN_SCOPE_GROUPS),
+        metavar="GROUP",
+        default=None,
+        help="Permission group to request. Repeat for multiple. "
+             f"Valid: {sorted(_LOGIN_SCOPE_GROUPS)}. Default: all groups.",
+    )
+    parser.add_argument("--app", default=None,
+                        help="App label written to the keyfile (default: keep "
+                             "existing or 'office-connect').")
+    args = parser.parse_args(argv)
+
+    keyfile_path = Path(args.keyfile).expanduser()
+    existing: dict = {}
+    if keyfile_path.is_file():
+        try:
+            existing = json.loads(keyfile_path.read_text())
+        except json.JSONDecodeError as exc:
+            print(f"Error: existing keyfile is not valid JSON ({keyfile_path}): {exc}",
+                  file=sys.stderr)
+            sys.exit(1)
+
+    client_id = (
+        args.client_id
+        or existing.get("client_id")
+        or os.environ.get("O365_CLIENT_ID")
+    )
+    if not client_id:
+        print(
+            "Error: --client-id required (or set O365_CLIENT_ID, or store it "
+            "in the keyfile via a previous login).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    tenant_id = (
+        args.tenant_id
+        or existing.get("tenant_id")
+        or os.environ.get("O365_TENANT_ID")
+        or "common"
+    )
+    client_secret = (
+        args.client_secret
+        if args.client_secret is not None
+        else existing.get("client_secret") or os.environ.get("O365_CLIENT_SECRET", "")
+    )
+    app_label = args.app or existing.get("app") or "office-connect"
+
+    try:
+        scopes = _resolve_login_scopes(args.scope_groups)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    from msal import PublicClientApplication
+
+    authority = f"https://login.microsoftonline.com/{tenant_id}"
+    msal_app = PublicClientApplication(client_id, authority=authority)
+
+    flow = msal_app.initiate_device_flow(scopes=scopes)
+    if "user_code" not in flow:
+        err = flow.get("error_description") or flow.get("error") or flow
+        print(
+            "Error: failed to initiate device-code flow. The Azure AD app "
+            "registration usually needs 'Allow public client flows' enabled.\n"
+            f"  details: {err}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print(f"\n{flow['message']}\n", flush=True)
+    print("Waiting for sign-in… (Ctrl-C to cancel)", flush=True)
+
+    result = msal_app.acquire_token_by_device_flow(flow)
+    if "access_token" not in result:
+        err = result.get("error_description") or result.get("error") or result
+        print(f"Error: device flow did not return a token:\n  {err}", file=sys.stderr)
+        sys.exit(1)
+
+    claims = result.get("id_token_claims") or {}
+    email = (
+        claims.get("preferred_username")
+        or claims.get("upn")
+        or claims.get("email")
+        or existing.get("email", "")
+    )
+
+    new_data = {
+        "app": app_label,
+        "session_id": existing.get("session_id", ""),
+        "email": email,
+        "access_token": result["access_token"],
+        "refresh_token": result.get("refresh_token", existing.get("refresh_token", "")),
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "tenant_id": tenant_id,
+    }
+
+    keyfile_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_secure_json(str(keyfile_path), new_data)
+
+    print(f"\nSigned in as: {email or '(unknown)'}")
+    print(f"Keyfile written: {keyfile_path}")
+    granted = result.get("scope", "")
+    if granted:
+        print(f"Scopes granted ({len(granted.split())}): {granted}")
+    print("Running MCP servers will pick up the change on their next tool call.")
+
+
 def cli() -> None:
     """CLI entry point for the MCP server."""
     if len(sys.argv) >= 2 and sys.argv[1] == "import-token":
         return _cli_import_token(sys.argv[2:])
+    if len(sys.argv) >= 2 and sys.argv[1] == "login":
+        return _cli_login(sys.argv[2:])
 
     parser = argparse.ArgumentParser(description="Office 365 MCP Server")
     parser.add_argument("--keyfile", required=True, help="Path to JSON token file")
