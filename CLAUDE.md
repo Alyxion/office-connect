@@ -67,6 +67,28 @@ office-connect import-token ~/Downloads/token_export.json --dest /etc/office-con
 
 Both `login` and `import-token` write atomically with 0600 perms. Any running MCP server pointed at the destination picks up the new token on its next tool invocation — no client restart needed (mtime-watched).
 
+### Permission tiers and the global policy file
+
+Three trust tiers: `read_only` < `drafts` (default) < `all`. Each tool in `mcp_server.py` is tagged with its required tier in `TOOL_PERMISSIONS`; `list_tools` filters by tier *and* `call_tool` re-checks via `_require_allowed` before dispatching (defense in depth, fail-closed for any unknown tool name).
+
+The effective tier is computed from three sources — **the most restrictive level among the sources that are set wins**. If nothing is set anywhere, the default is `drafts`.
+
+| source | how to set |
+|---|---|
+| MCP CLI flag | `--permission-level read_only\|drafts\|all` in the launcher args |
+| environment variable | `OFFICE_CONNECT_PERMISSION_LEVEL=read_only` |
+| **global policy file** *(new)* | a JSON object with `permission_level` (or `max_permission_level`) at `~/.config/office-connect/policy.json` (default), overridable via `--policy-file PATH` or `$OFFICE_CONNECT_POLICY` |
+
+Example `~/.config/office-connect/policy.json`:
+
+```json
+{ "permission_level": "drafts" }
+```
+
+That single file then enforces a host-wide ceiling regardless of how an individual MCP launcher is configured — if any launcher asks for `all`, the resolver clamps it back down. Conversely, a launcher can always *tighten* further by setting its own `--permission-level read_only`.
+
+A malformed or partial policy file logs a `[PERM]` warning and is ignored (no silent loosening). All tool-gating logic is in `office_con/mcp_permissions.py`; tests live in `tests/test_mcp_permissions.py`.
+
 ### Mock System (`office_con/testing/`)
 
 Operates at the HTTP transport layer — `MockGraphTransport` intercepts `run_async()` in `WebUserInstance`. Handlers work unchanged.

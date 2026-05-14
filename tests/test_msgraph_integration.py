@@ -1,7 +1,12 @@
 """Read-only integration tests for office-mcp MS Graph handlers.
 
-Requires a valid token file at tests/msgraph_test_token.json.
-Run with: poetry run pytest dependencies/office-mcp/tests/test_msgraph_integration.py -v
+Token resolution order (first usable wins):
+1. ``tests/msgraph_test_token.json`` (legacy, gitignored)
+2. ``~/.config/office-connect/token.json`` (canonical MCP keyfile, written by
+   ``office-connect login``)
+3. ``token_file`` path in ``tests/test_config.json``, if set
+
+Run with: poetry run pytest tests/test_msgraph_integration.py -v
 """
 
 import json
@@ -25,12 +30,35 @@ from office_con.msgraph.files_handler import FilesHandler, Drive, DriveList, Dri
 # Fixtures
 # ---------------------------------------------------------------------------
 
-TOKEN_FILE = Path(__file__).parent / "msgraph_test_token.json"
+def _resolve_token_path() -> Path | None:
+    """Return the first usable token-file path, or None if none found."""
+    candidates: list[Path] = [
+        Path(__file__).parent / "msgraph_test_token.json",
+        Path.home() / ".config" / "office-connect" / "token.json",
+    ]
+    try:
+        from office_con.testing.mock_config import get_test_config
+        cfg_token = get_test_config().get("token_file")
+        if cfg_token:
+            candidates.append(Path(cfg_token).expanduser())
+    except Exception:
+        pass
+    for p in candidates:
+        if p.is_file():
+            return p
+    return None
+
+
+TOKEN_FILE = _resolve_token_path()
 
 
 def _load_token() -> dict:
-    if not TOKEN_FILE.exists():
-        pytest.skip(f"Token file not found: {TOKEN_FILE}")
+    if TOKEN_FILE is None:
+        pytest.skip(
+            "No usable token file found. Run `office-connect login` to write "
+            "~/.config/office-connect/token.json, or place a token JSON at "
+            "tests/msgraph_test_token.json, or set token_file in tests/test_config.json."
+        )
     with open(TOKEN_FILE) as f:
         return json.load(f)
 

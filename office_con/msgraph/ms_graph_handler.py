@@ -204,7 +204,11 @@ class MsGraphInstance(WebUserInstance):
             return make_mock_token_response(self._mock_profile.email, self._mock_profile.user_id)
         grant_type = form_data.get("grant_type", "unknown")
         form_data.setdefault("client_id", self.client_id)
-        form_data.setdefault("client_secret", self.client_secret)
+        # Only attach a secret when one is actually set — public-client flows
+        # (e.g. tokens minted via the device-code login) refresh without one,
+        # and Azure AD rejects requests that include an empty secret.
+        if self.client_secret:
+            form_data.setdefault("client_secret", self.client_secret)
         if self.scopes:
             form_data.setdefault("scope", " ".join(self.scopes))
         timeout = aiohttp.ClientTimeout(total=30)

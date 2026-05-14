@@ -35,6 +35,7 @@ from mcp.types import TextContent, Tool
 from office_con.mcp_permissions import (
     DEFAULT_LEVEL,
     ENV_VAR as PERMISSION_ENV_VAR,
+    POLICY_ENV_VAR,
     PermissionLevel,
     level_allows,
     parse_level,
@@ -99,6 +100,11 @@ async def _create_graph(keyfile: str) -> MsGraphInstance:
         tenant_id=data.get("tenant_id"),
     )
     inst.email = data.get("email")
+    # The MsGraphInstance __init__ falls back to $O365_CLIENT_SECRET when no
+    # value is passed. For the MCP server, the keyfile is the source of truth
+    # — a stale env var would silently override an intentional "no secret"
+    # setting (public-client / device-code flow). Force the keyfile's view.
+    inst.client_secret = data.get("client_secret") or None
     inst.cache_dict["access_token"] = data["access_token"]
     if data.get("refresh_token"):
         inst.cache_dict["refresh_token"] = data["refresh_token"]
@@ -2244,6 +2250,40 @@ def _resolve_login_scopes(group_names: list[str] | None) -> list[str]:
     return scopes
 
 
+async def _verify_login_async(keyfile_path: str) -> dict | None:
+    """Hit /me and /me/mailFolders/inbox to confirm the freshly-written keyfile
+    actually works against Graph. Returns a small dict on success, None on
+    failure."""
+    g = await _create_graph(keyfile_path)
+
+    prof_resp = await g.run_async(
+        url=f"{g.msg_endpoint}me?$select=displayName,mail,userPrincipalName,jobTitle",
+        token=None,
+    )
+    if prof_resp is None or getattr(prof_resp, "status_code", 0) != 200:
+        return None
+    profile = prof_resp.json()
+
+    inbox_total: int | None = None
+    inbox_unread: int | None = None
+    inbox_resp = await g.run_async(
+        url=f"{g.msg_endpoint}me/mailFolders/inbox?$select=totalItemCount,unreadItemCount",
+        token=None,
+    )
+    if inbox_resp is not None and getattr(inbox_resp, "status_code", 0) == 200:
+        inbox = inbox_resp.json()
+        inbox_total = inbox.get("totalItemCount")
+        inbox_unread = inbox.get("unreadItemCount")
+
+    return {
+        "display_name": profile.get("displayName"),
+        "mail": profile.get("mail") or profile.get("userPrincipalName"),
+        "job_title": profile.get("jobTitle"),
+        "inbox_total": inbox_total,
+        "inbox_unread": inbox_unread,
+    }
+
+
 def _cli_login(argv: list[str]) -> None:
     """Interactive OAuth login via device-code flow; writes/updates a keyfile.
 
@@ -2338,16 +2378,24 @@ def _cli_login(argv: list[str]) -> None:
         or app_config.get("tenant_id")
         or "common"
     )
-    client_secret = (
-        args.client_secret
-        if args.client_secret is not None
-        else (
-            existing.get("client_secret")
-            or os.environ.get("O365_CLIENT_SECRET")
-            or app_config.get("client_secret")
-            or ""
-        )
-    )
+    # Device-code flow is a public client flow — the resulting refresh_token
+    # does not want a client_secret on refresh. Only adopt a secret when the
+    # caller explicitly set one (via --client-secret or via the app-config
+    # file). $O365_CLIENT_SECRET is intentionally NOT consulted here: shells
+    # often have stale values left over from confidential-flow setups which
+    # then poison the new keyfile.
+    if args.client_secret is not None:
+        client_secret = args.client_secret
+    elif app_config.get("client_secret"):
+        client_secret = app_config["client_secret"]
+    else:
+        client_secret = ""
+        if os.environ.get("O365_CLIENT_SECRET"):
+            print(
+                "Note: $O365_CLIENT_SECRET is set but ignored. Device-code "
+                "flow is a public-client flow and does not use a secret.",
+                file=sys.stderr,
+            )
     app_label = (
         args.app
         or existing.get("app")
@@ -2436,7 +2484,31 @@ def _cli_login(argv: list[str]) -> None:
     granted = result.get("scope", "")
     if granted:
         print(f"Scopes granted ({len(granted.split())}): {granted}")
-    print("Running MCP servers will pick up the change on their next tool call.")
+
+    # Round-trip the new tokens against Graph to catch issues immediately
+    # rather than waiting for the first MCP tool call to surface them.
+    print("\nVerifying against Microsoft Graph…", flush=True)
+    try:
+        check = asyncio.run(_verify_login_async(str(keyfile_path)))
+    except Exception as exc:
+        print(f"  FAILED: {exc}", file=sys.stderr)
+        sys.exit(2)
+    if check is None:
+        print(
+            "  FAILED: Graph did not return a profile with the new token. "
+            "The token was written but the credentials may be missing scopes "
+            "or the app reg may need 'Allow public client flows' enabled.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    print(f"  Profile : {check['display_name']} <{check['mail']}>"
+          + (f" — {check['job_title']}" if check.get("job_title") else ""))
+    if check["inbox_total"] is not None:
+        print(f"  Inbox   : {check['inbox_total']:,} messages "
+              f"({check['inbox_unread']:,} unread)")
+    print("Login confirmed.")
+    print("\nRunning MCP servers will pick up the change on their next tool call.")
 
 
 def cli() -> None:
@@ -2453,8 +2525,22 @@ def cli() -> None:
         choices=[l.value for l in PermissionLevel],
         default=None,
         help=(
-            "Permission tier: read_only, drafts (default), or all. "
-            f"May also be set via the {PERMISSION_ENV_VAR} environment variable."
+            "Permission tier requested by this MCP launcher: read_only, "
+            "drafts (default), or all. Combined with the global policy file "
+            f"and ${PERMISSION_ENV_VAR}; the most restrictive level wins."
+        ),
+    )
+    parser.add_argument(
+        "--policy-file",
+        default=None,
+        help=(
+            "Path to a JSON policy file that acts as a host-wide ceiling on "
+            f"the permission level. Defaults to ${POLICY_ENV_VAR} or "
+            "~/.config/office-connect/policy.json. The file is a JSON object "
+            "with a permission_level field. If the file is missing it is "
+            "ignored — no ceiling. The most restrictive level among the "
+            "global policy, this --permission-level, and "
+            f"${PERMISSION_ENV_VAR} wins."
         ),
     )
     parser.add_argument(
@@ -2471,7 +2557,7 @@ def cli() -> None:
     )
     parsed = parser.parse_args()
     try:
-        level = resolve_level(parsed.permission_level)
+        level = resolve_level(parsed.permission_level, policy_file=parsed.policy_file)
         roots = _parse_attachment_roots(parsed.attachment_root)
         max_bytes = _parse_max_attachment_bytes()
     except ValueError as exc:
