@@ -2126,6 +2126,41 @@ async def main(
 
 
 DEFAULT_KEYFILE = "~/.config/office-connect/token.json"
+DEFAULT_APP_CONFIG = "~/.config/office-connect/config.json"
+APP_CONFIG_ENV = "OFFICE_CONNECT_APP_CONFIG"
+
+
+def _resolve_app_config_path(explicit: str | None) -> Path:
+    """Return the app-config path: CLI arg → env var → default."""
+    raw = explicit or os.environ.get(APP_CONFIG_ENV) or DEFAULT_APP_CONFIG
+    return Path(raw).expanduser()
+
+
+def _load_app_config(path: Path) -> dict:
+    """Read the optional app-credentials JSON. Returns {} if absent or invalid."""
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        logger.warning("[CLI] app config %s is not valid JSON; ignoring", path)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_app_config(path: Path, *, client_id: str, tenant_id: str,
+                     client_secret: str | None, app_label: str | None) -> None:
+    """Persist the Azure AD app credentials so future `login`s need no args."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, str] = {
+        "client_id": client_id,
+        "tenant_id": tenant_id,
+    }
+    if client_secret:
+        payload["client_secret"] = client_secret
+    if app_label:
+        payload["app"] = app_label
+    _write_secure_json(str(path), payload)
 
 
 def _cli_import_token(argv: list[str]) -> None:
@@ -2231,16 +2266,27 @@ def _cli_login(argv: list[str]) -> None:
         help="Keyfile path. Read for stored credentials, written on success "
              "(default: %(default)s).",
     )
+    parser.add_argument(
+        "--app-config",
+        default=None,
+        help=(
+            "App-credentials JSON path (client_id / tenant_id / optional "
+            "client_secret). Used to remember the Azure AD app between logins "
+            f"so re-auth needs no arguments. Default: ${APP_CONFIG_ENV} or "
+            f"{DEFAULT_APP_CONFIG}."
+        ),
+    )
     parser.add_argument("--client-id", default=None,
                         help="Azure AD application (client) ID. Falls back to the "
-                             "value in the keyfile, then $O365_CLIENT_ID.")
+                             "keyfile, then $O365_CLIENT_ID, then the app-config "
+                             "file.")
     parser.add_argument("--tenant-id", default=None,
-                        help="Tenant ID (or 'common'). Falls back to the keyfile, "
-                             "then $O365_TENANT_ID, then 'common'.")
+                        help="Tenant ID (or 'common'). Same fallback chain as "
+                             "--client-id; final default is 'common'.")
     parser.add_argument("--client-secret", default=None,
-                        help="Optional client secret. Stored in the keyfile so "
-                             "the refresh flow can use it. Falls back to the "
-                             "keyfile, then $O365_CLIENT_SECRET.")
+                        help="Optional client secret. Same fallback chain as "
+                             "--client-id. Stored in the keyfile + app-config "
+                             "so the refresh flow can use it.")
     parser.add_argument(
         "--scope",
         action="append",
@@ -2266,15 +2312,22 @@ def _cli_login(argv: list[str]) -> None:
                   file=sys.stderr)
             sys.exit(1)
 
+    app_config_path = _resolve_app_config_path(args.app_config)
+    app_config = _load_app_config(app_config_path)
+
     client_id = (
         args.client_id
         or existing.get("client_id")
         or os.environ.get("O365_CLIENT_ID")
+        or app_config.get("client_id")
     )
     if not client_id:
         print(
-            "Error: --client-id required (or set O365_CLIENT_ID, or store it "
-            "in the keyfile via a previous login).",
+            "Error: no client_id available. Pass --client-id, set $O365_CLIENT_ID, "
+            f"or create an app-config file (default {DEFAULT_APP_CONFIG}) with "
+            "client_id / tenant_id [/ client_secret]. After a successful login "
+            "this file is created/updated automatically so you won't need any "
+            "arguments next time.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -2282,14 +2335,25 @@ def _cli_login(argv: list[str]) -> None:
         args.tenant_id
         or existing.get("tenant_id")
         or os.environ.get("O365_TENANT_ID")
+        or app_config.get("tenant_id")
         or "common"
     )
     client_secret = (
         args.client_secret
         if args.client_secret is not None
-        else existing.get("client_secret") or os.environ.get("O365_CLIENT_SECRET", "")
+        else (
+            existing.get("client_secret")
+            or os.environ.get("O365_CLIENT_SECRET")
+            or app_config.get("client_secret")
+            or ""
+        )
     )
-    app_label = args.app or existing.get("app") or "office-connect"
+    app_label = (
+        args.app
+        or existing.get("app")
+        or app_config.get("app")
+        or "office-connect"
+    )
 
     try:
         scopes = _resolve_login_scopes(args.scope_groups)
@@ -2343,6 +2407,29 @@ def _cli_login(argv: list[str]) -> None:
 
     keyfile_path.parent.mkdir(parents=True, exist_ok=True)
     _write_secure_json(str(keyfile_path), new_data)
+
+    # Persist the Azure AD app credentials so future `login` calls work with
+    # no arguments at all. Only write when the file is missing or out of date
+    # — don't churn it on every login.
+    app_config_outdated = (
+        app_config.get("client_id") != client_id
+        or app_config.get("tenant_id") != tenant_id
+        or (client_secret and app_config.get("client_secret") != client_secret)
+        or (app_label and app_config.get("app") != app_label)
+    )
+    if app_config_outdated:
+        try:
+            _save_app_config(
+                app_config_path,
+                client_id=client_id,
+                tenant_id=tenant_id,
+                client_secret=client_secret or None,
+                app_label=app_label,
+            )
+            print(f"App config saved: {app_config_path}")
+        except OSError as exc:
+            print(f"Warning: could not save app config to {app_config_path}: {exc}",
+                  file=sys.stderr)
 
     print(f"\nSigned in as: {email or '(unknown)'}")
     print(f"Keyfile written: {keyfile_path}")

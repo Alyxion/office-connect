@@ -54,20 +54,27 @@ Tokens are automatically refreshed (proactively when within 15 min of expiry, re
 
 ### Signing in for the first time (`office-connect login`)
 
-When you don't have any tokens yet, use the device-code login. The first run takes your Azure AD app credentials; every subsequent re-auth needs no arguments because the credentials are persisted in the keyfile.
+When you don't have any tokens yet, use the device-code login. The first run takes your Azure AD app credentials once and saves them; every subsequent re-auth needs no arguments at all.
 
 ```bash
 # Cold start — supply the Azure AD app once
 office-connect login --client-id <APP_ID> --tenant-id <TENANT_ID> [--client-secret <SECRET>]
 
-# Already-configured keyfile — re-auth with no args
+# From there on — re-auth with zero arguments
 office-connect login
 
 # Narrow scopes (default is all eight groups)
 office-connect login --scope mail --scope calendar
 ```
 
-`office-connect login` prints a `microsoft.com/devicelogin` URL plus a short code, blocks polling Microsoft until you finish signing in, and writes the canonical keyfile (`~/.config/office-connect/token.json` by default, override with `--keyfile`). Available scope groups: `profile`, `directory`, `mail`, `calendar`, `chat`, `teams`, `drive`, `tasks`.
+`office-connect login` prints a `microsoft.com/devicelogin` URL plus a short code, blocks polling Microsoft until you finish signing in, then writes two files:
+
+- `~/.config/office-connect/token.json` — the keyfile (access + refresh tokens), 0600 permissions
+- `~/.config/office-connect/config.json` — the **app config**: client_id / tenant_id / optional client_secret, 0600 permissions
+
+Both paths are configurable (`--keyfile` and `--app-config`, or env var `OFFICE_CONNECT_APP_CONFIG`). When `login` resolves credentials it tries, in order: explicit CLI args → existing keyfile → `O365_CLIENT_ID` etc. → app-config file. You can also pre-create the app-config file by hand — it's just a JSON object with `client_id`, `tenant_id`, and optional `client_secret`.
+
+Available scope groups: `profile`, `directory`, `mail`, `calendar`, `chat`, `teams`, `drive`, `tasks`.
 
 > Your Azure AD app registration must have **"Allow public client flows"** enabled in its authentication manifest for device-code flow to work.
 
