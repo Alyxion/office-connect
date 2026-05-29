@@ -107,7 +107,7 @@ class TestServerSetup:
 
     def test_tool_count(self):
         """All read + draft + all-tier tools. Update this when adding new tools."""
-        assert len(TOOLS) == 38
+        assert len(TOOLS) == 45
 
     def test_tool_names_unique(self):
         names = [t.name for t in TOOLS]
@@ -559,6 +559,11 @@ class TestToolCoverage:
         from office_con.mcp_permissions import PermissionLevel
         from office_con.mcp_server import TOOL_PERMISSIONS
         tested_tools = {
+            # Covered in tests/test_mail_enrichments_integration.py (real API):
+            "o365_check_connection",
+            "o365_get_mails",
+            "o365_unread_counts",
+            # Covered in this file:
             "o365_get_profile",
             "o365_list_mail",
             "o365_get_mail",

@@ -74,6 +74,18 @@ class MockGraphTransport:
         parsed = urlparse(url)
         qs = parse_qs(parsed.query)
 
+        # ── /$batch ──────────────────────────────────────────
+        if path == "$batch" and method == "POST":
+            return await self._batch_response(json_body)
+
+        # ── /me/events/{id} (PATCH update) ───────────────────
+        if re.match(r"me/events/[^/]+$", path) and method == "PATCH":
+            event_id = path.split("/")[-1]
+            merged = {"id": event_id, **(json_body or {})}
+            merged.setdefault("subject", "Updated event")
+            merged.setdefault("webLink", "https://outlook.office.com/calendar/mock/" + event_id)
+            return _make_response(200, merged)
+
         # ── /me ──────────────────────────────────────────────
         if path == "me":
             return self._profile_response()
@@ -365,6 +377,21 @@ class MockGraphTransport:
             "unreadItemCount": sum(1 for m in self._profile.mail_messages if not m.get("isRead")),
         })
 
+    async def _batch_response(self, json_body: dict | None) -> _MockResponse:
+        """Dispatch each Graph $batch sub-request through handle_request."""
+        base = "https://graph.microsoft.com/v1.0"
+        responses = []
+        for req in (json_body or {}).get("requests", []):
+            rel = req.get("url", "")
+            sub_url = f"{base}{rel}" if rel.startswith("/") else f"{base}/{rel}"
+            sub = await self.handle_request(sub_url, req.get("method", "GET"), req.get("body"))
+            responses.append({
+                "id": req.get("id"),
+                "status": sub.status_code,
+                "body": sub.json(),
+            })
+        return _make_response(200, {"responses": responses})
+
     def _messages_response(self, path: str, method: str,
                            json_body: dict | None,
                            qs: dict | None = None) -> _MockResponse:
@@ -377,6 +404,9 @@ class MockGraphTransport:
             return _make_response(202, {})
         # POST me/messages/{id}/replyAll
         if method == "POST" and path.endswith("/replyAll"):
+            return _make_response(202, {})
+        # POST me/messages/{id}/forward
+        if method == "POST" and path.endswith("/forward"):
             return _make_response(202, {})
         # POST me/messages/{id}/send
         if method == "POST" and path.endswith("/send"):
