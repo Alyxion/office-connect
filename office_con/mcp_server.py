@@ -41,9 +41,29 @@ from office_con.mcp_permissions import (
     parse_level,
     resolve_level,
 )
-from office_con.msgraph.ms_graph_handler import MsGraphInstance
+from office_con.msgraph.ms_graph_handler import AuthExpiredError, MsGraphInstance
 
 logger = logging.getLogger(__name__)
+
+# Shown to the MCP client whenever the Office 365 session is dead. It names the
+# exact command to fix it so the assistant can guide the user instead of
+# guessing from empty results.
+REAUTH_HINT = (
+    "Reconnect by running this on the machine hosting this MCP server:\n\n"
+    "    office-connect login\n\n"
+    "It reuses the saved Azure AD app credentials (zero arguments), prints a "
+    "https://microsoft.com/devicelogin code to finish sign-in, and rewrites the "
+    "token file. No client restart is needed — the server watches the keyfile "
+    "and picks up the new token on the next call."
+)
+
+
+def _auth_error_text(detail: str) -> str:
+    """Build the user-facing message for an expired/failed Office 365 session."""
+    return (
+        "⚠️ Office 365 authentication is not working, so this request could not "
+        f"be completed.\n\nDetails: {detail}\n\n{REAUTH_HINT}"
+    )
 
 
 def _write_secure_json(path: str, data: dict) -> None:
@@ -151,6 +171,18 @@ async def _create_graph(keyfile: str) -> MsGraphInstance:
 TOOLS = [
     # ── Profile ───────────────────────────────────────────────────────
     Tool(
+        name="o365_check_connection",
+        description=(
+            "Health check: verify the Microsoft 365 session is actually authenticated. "
+            "Call this FIRST whenever the user asks whether the connection/integration "
+            "is still working, or when other tools return empty/null results, to "
+            "distinguish a genuinely empty mailbox from a dead login. Returns "
+            "{connected: true, email, display_name} when healthy; on failure it "
+            "returns a clear message instructing the user to run `office-connect login`."
+        ),
+        inputSchema={"type": "object", "properties": {}, "required": []},
+    ),
+    Tool(
         name="o365_get_profile",
         description="Get the current user's profile (name, email, job title, department, phone, location).",
         inputSchema={"type": "object", "properties": {}, "required": []},
@@ -158,25 +190,57 @@ TOOLS = [
     # ── Mail ──────────────────────────────────────────────────────────
     Tool(
         name="o365_list_mail",
-        description="List recent emails from the user's inbox.",
+        description=(
+            "List recent emails (header metadata + recipients, no full body — use "
+            "o365_get_mail / o365_get_mails for bodies). Results include "
+            "to_recipients/cc_recipients, conversation_id and internet_message_id so "
+            "you can filter and thread in-memory without extra fetches."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
                 "limit": {"type": "integer", "description": "Max emails to return (default 10)", "default": 10},
                 "skip": {"type": "integer", "description": "Number of emails to skip for pagination", "default": 0},
+                "folder": {"type": "string", "description": "Folder to list. Well-known names: inbox (default), sent, drafts, deleteditems, junk, archive, outbox — or a folder id."},
+                "exclude_folders": {"type": "array", "items": {"type": "string"}, "description": "Drop results from these folders (well-known names or ids), e.g. ['deleteditems','junk']. Client-side filter — may return fewer than 'limit'."},
             },
             "required": [],
         },
     ),
     Tool(
         name="o365_get_mail",
-        description="Get a single email by ID, including full body and attachments metadata.",
+        description=(
+            "Get a single email by ID, including body and attachments metadata. "
+            "Use body_format='text' to avoid bloated HTML; bodies over max_body_chars "
+            "are truncated with body_truncated=true (raise max_body_chars or pass "
+            "body_format='text' to get the rest). Meeting-request mails include event_id "
+            "for o365_get_events."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
                 "email_id": {"type": "string", "description": "The email message ID"},
+                "body_format": {"type": "string", "enum": ["text", "html", "none"], "description": "text = plain text (recommended for reading), html = raw HTML, none = skip body. Default text.", "default": "text"},
+                "max_body_chars": {"type": "integer", "description": "Truncate body to this many chars (default 50000). 0 = no limit.", "default": 50000},
             },
             "required": ["email_id"],
+        },
+    ),
+    Tool(
+        name="o365_get_mails",
+        description=(
+            "Batch-fetch multiple emails by ID in ONE round trip (Graph $batch). Use "
+            "this to pull a whole thread/conversation at once instead of N get_mail "
+            "calls. Returns messages in the order requested; missing ids are skipped."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "ids": {"type": "array", "items": {"type": "string"}, "description": "Message IDs to fetch"},
+                "body_format": {"type": "string", "enum": ["text", "html", "none"], "description": "text (default), html, or none.", "default": "text"},
+                "max_body_chars": {"type": "integer", "description": "Truncate each body to this many chars (default 50000). 0 = no limit.", "default": 50000},
+            },
+            "required": ["ids"],
         },
     ),
     Tool(
@@ -190,7 +254,9 @@ TOOLS = [
             "Search emails efficiently using MS Graph KQL ($search). Prefer this over "
             "paging through o365_list_mail when the user gives ANY criterion "
             "(sender name, subject keyword, date range, etc.). All structured params "
-            "are AND-ed. Dates are inclusive. Returns recent matches across all folders."
+            "are AND-ed. Dates are inclusive. Returns header metadata + recipients "
+            "(no body) so you can filter in-memory. Searches all folders unless 'folder' "
+            "is given; 'exclude_folders' drops e.g. Deleted/Junk."
         ),
         inputSchema={
             "type": "object",
@@ -203,10 +269,20 @@ TOOLS = [
                 "until": {"type": "string", "description": "Received on or before (YYYY-MM-DD)"},
                 "has_attachments": {"type": "boolean", "description": "Only mails with attachments"},
                 "query": {"type": "string", "description": "Raw KQL (overrides/augments other params)"},
+                "folder": {"type": "string", "description": "Restrict search to this folder (well-known name or id), e.g. 'sent'."},
+                "exclude_folders": {"type": "array", "items": {"type": "string"}, "description": "Drop hits from these folders (well-known names or ids), e.g. ['deleteditems','junk']."},
                 "limit": {"type": "integer", "description": "Max results (default 25, Graph caps at 250)", "default": 25},
             },
             "required": [],
         },
+    ),
+    Tool(
+        name="o365_unread_counts",
+        description=(
+            "Return per-folder unread (and total) message counts without paging "
+            "through messages. Useful for 'how many unread do I have?' across folders."
+        ),
+        inputSchema={"type": "object", "properties": {}, "required": []},
     ),
     # ── Mail writes: drafts (DRAFTS tier) ─────────────────────────────
     Tool(
@@ -336,6 +412,38 @@ TOOLS = [
                 "email_id": {"type": "string", "description": "Draft message id"},
             },
             "required": ["email_id"],
+        },
+    ),
+    Tool(
+        name="o365_reply_to_mail",
+        description=(
+            "Reply to an email and send immediately, preserving subject/threading. "
+            "Set reply_all=true to reply to everyone. Requires ALL permission level."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "email_id": {"type": "string", "description": "Message id to reply to"},
+                "body": {"type": "string", "description": "Your reply comment (plain text). Graph keeps the quoted original and threading."},
+                "reply_all": {"type": "boolean", "description": "Reply to all recipients (default false)", "default": False},
+            },
+            "required": ["email_id", "body"],
+        },
+    ),
+    Tool(
+        name="o365_forward_mail",
+        description=(
+            "Forward an email to new recipients and send immediately. "
+            "Requires ALL permission level."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "email_id": {"type": "string", "description": "Message id to forward"},
+                "to": {"type": "array", "items": {"type": "string"}, "description": "Recipient email addresses"},
+                "body": {"type": "string", "description": "Optional comment (plain text) added above the forwarded message"},
+            },
+            "required": ["email_id", "to"],
         },
     ),
     Tool(
@@ -476,6 +584,67 @@ TOOLS = [
                 "calendar_id": {"type": "string", "description": "Calendar id (omit for default)"},
             },
             "required": ["subject", "start", "end"],
+        },
+    ),
+    Tool(
+        name="o365_update_event",
+        description=(
+            "Update an existing calendar event by id (PATCH). Only provided fields "
+            "change; changing time or attendees makes Graph notify attendees. "
+            "Requires ALL permission level."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "event_id": {"type": "string", "description": "Event id to update"},
+                "subject": {"type": "string", "description": "New subject"},
+                "start": {"type": "string", "description": "New start datetime (ISO 8601)"},
+                "end": {"type": "string", "description": "New end datetime (ISO 8601)"},
+                "body": {"type": "string", "description": "New body/description"},
+                "is_html": {"type": "boolean", "description": "Body is HTML (default false)", "default": False},
+                "location": {"type": "string", "description": "New location display name"},
+                "attendees": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"email": {"type": "string"}, "name": {"type": "string"}},
+                        "required": ["email"],
+                    },
+                    "description": "Replace the attendee list; each {email, name?}",
+                },
+                "is_all_day": {"type": "boolean", "description": "All-day event"},
+            },
+            "required": ["event_id"],
+        },
+    ),
+    Tool(
+        name="o365_send_event_invite",
+        description=(
+            "Create a meeting and send invites to attendees in one step (attendees "
+            "required; Graph emails the invitations immediately). Use this to book a "
+            "meeting end-to-end. Requires ALL permission level."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "subject": {"type": "string", "description": "Meeting subject"},
+                "start": {"type": "string", "description": "Start datetime (ISO 8601)"},
+                "end": {"type": "string", "description": "End datetime (ISO 8601)"},
+                "attendees": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"email": {"type": "string"}, "name": {"type": "string"}},
+                        "required": ["email"],
+                    },
+                    "description": "Invitees; each {email, name?}",
+                },
+                "body": {"type": "string", "description": "Meeting body/agenda"},
+                "is_html": {"type": "boolean", "description": "Body is HTML (default false)", "default": False},
+                "location": {"type": "string", "description": "Location display name"},
+                "calendar_id": {"type": "string", "description": "Calendar id (omit for default)"},
+            },
+            "required": ["subject", "start", "end", "attendees"],
         },
     ),
     Tool(
@@ -775,19 +944,25 @@ TOOLS = [
 # ``tests/test_mcp_permissions.py`` enforces full coverage.
 
 TOOL_PERMISSIONS: dict[str, PermissionLevel] = {
+    # Diagnostics
+    "o365_check_connection": PermissionLevel.READ_ONLY,
     # Profile
     "o365_get_profile": PermissionLevel.READ_ONLY,
     # Mail — read
     "o365_list_mail": PermissionLevel.READ_ONLY,
     "o365_get_mail": PermissionLevel.READ_ONLY,
+    "o365_get_mails": PermissionLevel.READ_ONLY,
     "o365_get_mail_categories": PermissionLevel.READ_ONLY,
     "o365_search_mail": PermissionLevel.READ_ONLY,
+    "o365_unread_counts": PermissionLevel.READ_ONLY,
     # Mail — draft lifecycle (target is always a draft)
     "o365_create_mail_draft": PermissionLevel.DRAFTS,
     "o365_update_mail_draft": PermissionLevel.DRAFTS,
     # Mail — sending and mutation of real messages
     "o365_send_mail": PermissionLevel.ALL,
     "o365_send_mail_draft": PermissionLevel.ALL,
+    "o365_reply_to_mail": PermissionLevel.ALL,
+    "o365_forward_mail": PermissionLevel.ALL,
     "o365_delete_mail": PermissionLevel.ALL,
     "o365_move_mail": PermissionLevel.ALL,
     "o365_flag_mail_read": PermissionLevel.ALL,
@@ -798,6 +973,8 @@ TOOL_PERMISSIONS: dict[str, PermissionLevel] = {
     "o365_get_schedule": PermissionLevel.READ_ONLY,
     "o365_search_events": PermissionLevel.READ_ONLY,
     "o365_create_event": PermissionLevel.ALL,
+    "o365_update_event": PermissionLevel.ALL,
+    "o365_send_event_invite": PermissionLevel.ALL,
     # Teams
     "o365_list_teams": PermissionLevel.READ_ONLY,
     "o365_list_channels": PermissionLevel.READ_ONLY,
@@ -1334,6 +1511,18 @@ def _peek_result(
     return [TextContent(type="text", text=json.dumps(peek, default=str, indent=2))] + images
 
 
+def _body_opts(args: dict) -> tuple[str, int | None]:
+    """Resolve (body_format, max_body_chars) for mail-fetch tools. A
+    max_body_chars of 0 (or negative) means 'no limit'."""
+    fmt = args.get("body_format", "text")
+    raw = args.get("max_body_chars", 50000)
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        n = 50000
+    return fmt, (n if n > 0 else None)
+
+
 def _json_result(obj: Any) -> list[TextContent]:
     """Serialize a Pydantic model or dict to JSON TextContent."""
     if hasattr(obj, "model_dump"):
@@ -1362,6 +1551,32 @@ async def _handle_tool(
     if attachment_roots is None:
         attachment_roots = []
 
+    # ── Diagnostics ───────────────────────────────────────────────────
+    if name == "o365_check_connection":
+        token = await graph.get_access_token_async()
+        if not token:
+            return [TextContent(type="text", text=_auth_error_text(
+                "No Microsoft 365 access token is available."
+            ))]
+        # Probe /me directly. run_async raises AuthExpiredError on a dead
+        # session (caught by call_tool → clear re-auth message); a non-401
+        # non-200 is reported as a degraded connection rather than swallowed.
+        resp = await graph.run_async(url=f"{graph.msg_endpoint}me", token=token)
+        if resp is None or resp.status_code != 200:
+            status = getattr(resp, "status_code", "no response")
+            return [TextContent(type="text", text=(
+                "⚠️ Office 365 connection check failed — Microsoft Graph "
+                f"returned {status} for /me.\n\n{REAUTH_HINT}"
+            ))]
+        me = resp.json()
+        return _json_result({
+            "connected": True,
+            "email": me.get("mail") or me.get("userPrincipalName"),
+            "display_name": me.get("displayName"),
+            "job_title": me.get("jobTitle"),
+            "checked_endpoint": "/me",
+        })
+
     # ── Profile ───────────────────────────────────────────────────────
     if name == "o365_get_profile":
         handler = await graph.get_profile_async()
@@ -1373,18 +1588,42 @@ async def _handle_tool(
         result = await mail.email_index_async(
             limit=args.get("limit", 10),
             skip=args.get("skip", 0),
+            folder=args.get("folder"),
+            exclude_folders=args.get("exclude_folders"),
         )
         return _json_result(result)
 
     if name == "o365_get_mail":
         mail = graph.get_mail()
-        result = await mail.get_mail_async(email_id=args["email_id"])
+        fmt, max_chars = _body_opts(args)
+        result = await mail.get_mail_async(
+            email_id=args["email_id"], body_format=fmt, max_body_chars=max_chars,
+        )
         return _json_result(result)
+
+    if name == "o365_get_mails":
+        mail = graph.get_mail()
+        fmt, max_chars = _body_opts(args)
+        result = await mail.get_mails_async(
+            args.get("ids", []), body_format=fmt, max_body_chars=max_chars,
+        )
+        return _json_result([m.model_dump() for m in result])
 
     if name == "o365_get_mail_categories":
         mail = graph.get_mail()
         result = await mail.get_categories_async()
         return _json_result([c.model_dump() for c in result])
+
+    if name == "o365_unread_counts":
+        folders = await graph.get_mail_folders().get_folders_async(recursive=True)
+        rows = [
+            {"folder": f.name, "id": f.id, "unread": f.unread, "total": f.total}
+            for f in folders
+        ]
+        return _json_result({
+            "total_unread": sum(f.unread for f in folders),
+            "folders": rows,
+        })
 
     if name == "o365_search_mail":
         kql = _build_mail_kql(args)
@@ -1395,7 +1634,11 @@ async def _handle_tool(
                      "from/to/subject/body/since/until/has_attachments/query.",
             )]
         mail = graph.get_mail()
-        result = await mail.email_index_async(query=kql, limit=args.get("limit", 25))
+        result = await mail.email_index_async(
+            query=kql, limit=args.get("limit", 25),
+            folder=args.get("folder"),
+            exclude_folders=args.get("exclude_folders"),
+        )
         return _json_result(result)
 
     # ── Mail: drafts (DRAFTS tier) ────────────────────────────────────
@@ -1539,6 +1782,20 @@ async def _handle_tool(
         ok = await mail.send_draft_async(args["email_id"])
         return _json_result({"sent": ok})
 
+    if name == "o365_reply_to_mail":
+        mail = graph.get_mail()
+        ok = await mail.reply_async(
+            args["email_id"], args["body"], reply_all=args.get("reply_all", False),
+        )
+        return _json_result({"sent": ok, "reply_all": args.get("reply_all", False)})
+
+    if name == "o365_forward_mail":
+        mail = graph.get_mail()
+        ok = await mail.forward_async(
+            args["email_id"], args.get("to", []), args.get("body", ""),
+        )
+        return _json_result({"sent": ok})
+
     if name == "o365_delete_mail":
         mail = graph.get_mail()
         ok = await mail.delete_message_async(args["email_id"])
@@ -1655,6 +1912,42 @@ async def _handle_tool(
         )
         if result is None:
             return [TextContent(type="text", text="Failed to create event.")]
+        return _json_result(result)
+
+    if name == "o365_send_event_invite":
+        from datetime import datetime
+        cal = graph.get_calendar()
+        # A calendar event with attendees: Graph emails the invites on create.
+        result = await cal.create_event_async(
+            subject=args["subject"],
+            start_time=datetime.fromisoformat(args["start"]),
+            end_time=datetime.fromisoformat(args["end"]),
+            body=args.get("body"),
+            is_html=args.get("is_html", False),
+            location=args.get("location"),
+            attendees=args["attendees"],
+            calendar_id=args.get("calendar_id"),
+        )
+        if result is None:
+            return [TextContent(type="text", text="Failed to create meeting / send invites.")]
+        return _json_result(result)
+
+    if name == "o365_update_event":
+        from datetime import datetime
+        cal = graph.get_calendar()
+        result = await cal.update_event_async(
+            args["event_id"],
+            subject=args.get("subject"),
+            start_time=datetime.fromisoformat(args["start"]) if args.get("start") else None,
+            end_time=datetime.fromisoformat(args["end"]) if args.get("end") else None,
+            body=args.get("body"),
+            is_html=args.get("is_html", False),
+            location=args.get("location"),
+            attendees=args.get("attendees"),
+            is_all_day=args.get("is_all_day"),
+        )
+        if result is None:
+            return [TextContent(type="text", text="Failed to update event (no fields, bad id, or auth).")]
         return _json_result(result)
 
     if name == "o365_get_schedule":
@@ -2047,7 +2340,12 @@ def create_server(
             "Provides tools for mail, calendar, teams, chats, files, directory, "
             "and profile data via Microsoft Graph API. Write operations are "
             "gated by permission level — the server advertises and accepts "
-            "only tools permitted at the configured level."
+            "only tools permitted at the configured level.\n\n"
+            "AUTH: If any tool result reports that authentication failed/expired "
+            "(message starts with '⚠️ Office 365 authentication'), the session is "
+            "dead — do NOT treat empty results as real data. Relay the message and "
+            "tell the user to run `office-connect login`. To explicitly verify the "
+            "connection, call o365_check_connection."
         ),
     )
 
@@ -2089,11 +2387,22 @@ def create_server(
             return [TextContent(type="text", text=f"Permission denied: {exc}")]
         try:
             graph = await _get_graph()
+            # Pre-flight: if there is no usable access token at all (cold start
+            # with an empty/expired keyfile and no refresh), fail loudly with a
+            # re-auth hint rather than letting handlers return empty results.
+            if not graph.cache_dict.get("access_token"):
+                return [TextContent(type="text", text=_auth_error_text(
+                    "No Microsoft 365 access token is available — the session "
+                    "has never been authenticated or the token file is empty."
+                ))]
             return await _handle_tool(
                 graph, name, arguments,
                 attachment_roots=attachment_roots,
                 max_attachment_bytes=max_attachment_bytes,
             )
+        except AuthExpiredError as exc:
+            logger.warning("[MCP] auth expired on tool %s: %s", name, exc)
+            return [TextContent(type="text", text=_auth_error_text(str(exc)))]
         except Exception:
             logger.exception("Tool %s failed", name)
             return [TextContent(type="text", text=f"Error: tool '{name}' failed. Check server logs for details.")]
@@ -2511,6 +2820,22 @@ def _cli_login(argv: list[str]) -> None:
     print("\nRunning MCP servers will pick up the change on their next tool call.")
 
 
+_USAGE_BANNER = """\
+office-connect — Microsoft 365 MCP server & token CLI
+
+Subcommands:
+  office-connect login                 Sign in / re-auth via device code (zero args after first setup)
+  office-connect import-token PATH     Install an externally-exported token at the canonical location
+
+Run the MCP server (used by Claude Desktop etc.):
+  office-connect --keyfile PATH/token.json [--permission-level ...]
+
+For more help on a subcommand:
+  office-connect login -h
+  office-connect import-token -h
+"""
+
+
 def cli() -> None:
     """CLI entry point for the MCP server."""
     if len(sys.argv) >= 2 and sys.argv[1] == "import-token":
@@ -2518,7 +2843,20 @@ def cli() -> None:
     if len(sys.argv) >= 2 and sys.argv[1] == "login":
         return _cli_login(sys.argv[2:])
 
-    parser = argparse.ArgumentParser(description="Office 365 MCP Server")
+    # Bare invocation with no args: most people are trying to (re-)authenticate,
+    # not launch the server (which needs --keyfile). Point them at the
+    # subcommands instead of erroring with a usage line that hides them.
+    if len(sys.argv) == 1:
+        sys.stderr.write(_USAGE_BANNER)
+        raise SystemExit(2)
+
+    parser = argparse.ArgumentParser(
+        description="Office 365 MCP Server",
+        epilog=(
+            "Subcommands: 'office-connect login' to sign in / re-auth, "
+            "'office-connect import-token PATH' to install an exported token."
+        ),
+    )
     parser.add_argument("--keyfile", required=True, help="Path to JSON token file")
     parser.add_argument(
         "--permission-level",

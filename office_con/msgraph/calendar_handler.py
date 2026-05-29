@@ -248,6 +248,61 @@ class CalendarHandler:
         except Exception:
             return None
 
+    async def update_event_async(
+        self,
+        event_id: str,
+        *,
+        subject: Optional[str] = None,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        body: Optional[str] = None,
+        is_html: bool = False,
+        location: Optional[str] = None,
+        attendees: Optional[List[Dict[str, str]]] = None,
+        is_all_day: Optional[bool] = None,
+    ) -> Optional[CalendarEvent]:
+        """Patch an existing calendar event. Only the provided fields change;
+        changing time/attendees makes Graph send update notices to attendees."""
+        access_token = await self.msg.get_access_token_async()
+        if not access_token:
+            return None
+
+        patch: Dict = {}
+        if subject is not None:
+            patch["subject"] = subject
+        if body is not None:
+            patch["body"] = {"contentType": "HTML" if is_html else "Text", "content": body}
+        if start_time is not None:
+            patch["start"] = {"dateTime": start_time.isoformat(), "timeZone": "UTC"}
+        if end_time is not None:
+            patch["end"] = {"dateTime": end_time.isoformat(), "timeZone": "UTC"}
+        if location is not None:
+            patch["location"] = {"displayName": location}
+        if is_all_day is not None:
+            patch["isAllDay"] = is_all_day
+        if attendees is not None:
+            patch["attendees"] = [
+                {
+                    "emailAddress": {
+                        "address": a["email"],
+                        "name": a.get("name", a["email"]),
+                    },
+                    "type": "required",
+                }
+                for a in attendees
+            ]
+        if not patch:
+            return None
+
+        url = f"{self.msg.msg_endpoint}me/events/{event_id}"
+        response = await self.msg.run_async(url=url, method="PATCH", json=patch, token=access_token)
+        if response is None or response.status_code != 200:
+            return None
+        try:
+            return self.parse_event(response.json())
+        except Exception:
+            return None
+
     async def get_user_timezone_async(self) -> str:
         """Return the logged-in user's timezone."""
         access_token = await self.msg.get_access_token_async()

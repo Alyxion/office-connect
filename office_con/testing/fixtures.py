@@ -601,6 +601,8 @@ def default_mail_inbox(messages_per_folder: int = 5) -> list[dict]:
             "flag": {"flagStatus": "notFlagged"},
             "webLink": f"https://outlook.office.com/mail/mock/{_uid()}",
             "conversationId": _uid(),
+            "internetMessageId": f"<{_uid()}@example.com>",
+            "parentFolderId": folder_id,
             "_folder_id": folder_id,
         }
 

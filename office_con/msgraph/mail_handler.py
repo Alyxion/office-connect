@@ -32,23 +32,46 @@ class OfficeMailCategory(BaseModel):
     color: str = Field(description="Resolved HTML colour, e.g. '#e74856'")
 
 
+class MailAddress(BaseModel):
+    """A single recipient/sender mailbox: display name + SMTP address."""
+    name: str | None = Field(default=None, description="Display name, e.g. 'Michael Ikemann'")
+    address: str | None = Field(default=None, description="SMTP email address, e.g. 'm@example.com'")
+    legacy_dn: str | None = Field(
+        default=None,
+        description="Original Exchange legacy DN if 'address' was an X500/EX path that could not be resolved to SMTP",
+    )
+
+
 class OfficeMail(BaseModel):
     """A single Outlook email message with metadata and body."""
     email_id: str = Field(description="MS Graph message id")
-    email_url: Optional[str] = Field(default=None, description="Full MS Graph URL for this message")
+    email_url: Optional[str] = Field(default=None, description="DEPRECATED alias of graph_url (MS Graph API URL). Prefer graph_url / outlook_url.")
     flag_state: Literal["flagged", "notFlagged", "done"] = Field(default="notFlagged", description="Follow-up flag state")
     importance: str | None = Field(default="normal", description="Importance level: low, normal, high")
     is_read: bool = Field(default=False, description="Whether the message has been read")
     email_type: str = Field(description="Type of email, e.g. 'inbox'")
     local_timestamp: str | None = Field(default=None, description="Received time in local timezone as string")
-    from_name: str | None = Field(default=None, description="Sender display name")
-    from_email: str | None = Field(default=None, description="Sender email address")
+    from_name: str | None = Field(default=None, description="Sender display name (the 'from' mailbox)")
+    from_email: str | None = Field(default=None, description="Sender email address (the 'from' mailbox)")
+    sender_name: str | None = Field(default=None, description="Actual sending mailbox display name (differs from 'from' for send-on-behalf)")
+    sender_email: str | None = Field(default=None, description="Actual sending mailbox address (differs from 'from' for send-on-behalf)")
+    to_recipients: List[MailAddress] = Field(default_factory=list, description="To recipients")
+    cc_recipients: List[MailAddress] = Field(default_factory=list, description="Cc recipients")
+    bcc_recipients: List[MailAddress] = Field(default_factory=list, description="Bcc recipients (only populated on your own sent/draft items)")
+    reply_to: List[MailAddress] = Field(default_factory=list, description="Reply-To addresses, if set by the sender")
+    conversation_id: str | None = Field(default=None, description="Graph conversationId — pass to search to pull the rest of the thread")
+    internet_message_id: str | None = Field(default=None, description="RFC-822 Message-ID header — stable across forwards, use to dedupe a chain")
     subject: str | None = Field(default=None, description="Email subject line")
     body_preview: str | None = Field(default=None, description="Short plain-text preview of the body")
-    body: str | None = Field(default=None, description="Full email body content")
+    body: str | None = Field(default=None, description="Full email body content (HTML or text per body_type)")
+    body_text: str | None = Field(default=None, description="Plain-text rendering of the body (no HTML markup), when requested")
     body_type: str | None = Field(default=None, description="Body content type: 'html' or 'text'")
+    body_truncated: bool = Field(default=False, description="True when 'body' was cut to a size limit; re-fetch with expand_body=true / a higher max_body_chars for the full content")
     has_attachments: bool = Field(default=False, description="Whether the message has attachments")
-    web_link: Optional[str] = Field(default=None, description="Outlook Web App URL to open this message")
+    web_link: Optional[str] = Field(default=None, description="Outlook Web App URL to open this message (alias: outlook_url)")
+    graph_url: Optional[str] = Field(default=None, description="MS Graph API URL for this message (backend use; same value as the deprecated email_url)")
+    outlook_url: Optional[str] = Field(default=None, description="Human-openable Outlook Web URL (same value as web_link)")
+    event_id: Optional[str] = Field(default=None, description="For meeting-request messages (eventMessageRequest): the linked calendar event id — pass to o365_get_events")
     categories: List[str] = Field(default_factory=list, description="Assigned category labels")
     confidential_level: Optional[str] = Field(default=None, description="Sensitivity: normal, personal, private, confidential")
     attachments: List[OfficeMailAttachment] = Field(default_factory=list, description="File and inline attachments")
@@ -213,11 +236,104 @@ class MailFolderHandler:
         )
 
 
+# MS Graph well-known folder names accepted in place of a folder id. Friendly
+# aliases on the left map to the Graph token on the right.
+WELL_KNOWN_FOLDERS: dict[str, str] = {
+    "inbox": "inbox",
+    "drafts": "drafts",
+    "sent": "sentitems",
+    "sentitems": "sentitems",
+    "deleted": "deleteditems",
+    "deleteditems": "deleteditems",
+    "trash": "deleteditems",
+    "junk": "junkemail",
+    "junkemail": "junkemail",
+    "spam": "junkemail",
+    "archive": "archive",
+    "outbox": "outbox",
+}
+
+
+def resolve_well_known_folder(name: str | None) -> str | None:
+    """Map a friendly/well-known folder name to its Graph token. Returns the
+    input unchanged when it isn't a known alias (assumed to be a folder id)."""
+    if not name:
+        return None
+    return WELL_KNOWN_FOLDERS.get(name.strip().lower(), name)
+
+
+# Header metadata projection for body-less single-message fetches. NOTE: every
+# name here must be a real Graph message property — an unknown one fails the
+# WHOLE request with a 400 ParseUri (caught in real-API testing: 'sensitivity'
+# is not selectable on this tenant, so it's omitted; parse_mail defaults it).
+_NO_BODY_SELECT = (
+    "id,from,sender,toRecipients,ccRecipients,bccRecipients,replyTo,subject,"
+    "bodyPreview,receivedDateTime,isRead,hasAttachments,categories,importance,"
+    "conversationId,internetMessageId,webLink,flag"
+)
+
+
+def _html_to_text(html: str | None) -> str | None:
+    """Strip HTML to readable plain text. Returns None for falsy input."""
+    if not html:
+        return None
+    from bs4 import BeautifulSoup
+    return BeautifulSoup(html, "html.parser").get_text(separator=" ", strip=True)
+
+
+def _apply_body_limit(mail: "OfficeMail", max_chars: int | None) -> None:
+    """Truncate body/body_text to max_chars in-place, flagging body_truncated."""
+    if not max_chars:
+        return
+    if mail.body and len(mail.body) > max_chars:
+        mail.body = mail.body[:max_chars]
+        mail.body_truncated = True
+    if mail.body_text and len(mail.body_text) > max_chars:
+        mail.body_text = mail.body_text[:max_chars]
+        mail.body_truncated = True
+
+
+def _is_legacy_dn(address: str | None) -> bool:
+    """True for Exchange legacy X500/EX distinguished-name 'addresses' such as
+    ``/O=EXCHANGELABS/OU=.../CN=RECIPIENTS/CN=...`` — not usable SMTP."""
+    if not address:
+        return False
+    a = address.lstrip().lower()
+    return a.startswith("/o=") or "/cn=recipients/" in a or a.startswith("/ou=")
+
+
+def _parse_address(obj: dict | None) -> MailAddress | None:
+    """Turn a Graph ``{emailAddress: {name, address}}`` recipient into a
+    MailAddress, isolating legacy Exchange DNs into ``legacy_dn``."""
+    if not obj:
+        return None
+    ea = obj.get("emailAddress", obj) or {}
+    name = ea.get("name")
+    address = ea.get("address")
+    if _is_legacy_dn(address):
+        return MailAddress(name=name, address=None, legacy_dn=address)
+    return MailAddress(name=name, address=address)
+
+
+def _parse_address_list(items) -> List[MailAddress]:
+    out: List[MailAddress] = []
+    for item in items or []:
+        parsed = _parse_address(item)
+        if parsed is not None:
+            out.append(parsed)
+    return out
+
+
 class OfficeMailHandler:
     """Reads, sends, and manages Outlook emails via the MS Graph API."""
 
     def __init__(self, wui: "MsGraphInstance"):
         self.msg = wui
+        # Caches display-name → SMTP resolutions so legacy-DN senders are only
+        # looked up in the directory once per process. None marks "unresolved".
+        self._dn_smtp_cache: dict[str, str | None] = {}
+        # Caches well-known-folder-name → real folder id for exclusion filters.
+        self._folder_id_cache: dict[str, str] = {}
 
     # ── parsing helpers (no I/O) ──────────────────────────────────────────
 
@@ -278,16 +394,36 @@ class OfficeMailHandler:
                             attachment.is_embedded = True
                             break
 
+        sender_obj = _parse_address(email.get('sender'))
+        body_type = email.get('body', {}).get('contentType', None)
+        body_content = email.get('body', {}).get('content', "")
+        web_link = email.get('webLink', None)
+        # Meeting-request messages carry a linked calendar event; surface its id
+        # so callers can hand it to o365_get_events. Populated only when the
+        # caller expanded `event` (see get_mail_async).
+        event = email.get('event') or {}
+
         new_mail = OfficeMail(
             email_id=email.get('id', None),
             email_type=email.get('@odata.type', "mail"),
             local_timestamp=local_time_str,
             from_name=mail_address.get('name', None),
             from_email=mail_address.get('address', None),
+            sender_name=sender_obj.name if sender_obj else None,
+            sender_email=sender_obj.address if sender_obj else None,
+            to_recipients=_parse_address_list(email.get('toRecipients')),
+            cc_recipients=_parse_address_list(email.get('ccRecipients')),
+            bcc_recipients=_parse_address_list(email.get('bccRecipients')),
+            reply_to=_parse_address_list(email.get('replyTo')),
+            conversation_id=email.get('conversationId', None),
+            internet_message_id=email.get('internetMessageId', None),
             subject=email.get('subject', None),
-            body_preview=email['bodyPreview'],
-            body=email.get('body', {}).get('content', ""),
-            body_type=email.get('body', {}).get('contentType', None),
+            body_preview=email.get('bodyPreview', None),
+            body=body_content,
+            # When Graph returns a text body (Prefer: text), the content already
+            # is plain text — expose it directly; HTML→text is done at fetch time.
+            body_text=body_content if body_type == 'text' else None,
+            body_type=body_type,
             is_read=email.get('isRead', False),
             has_attachments=email.get('hasAttachments', False),
             categories=email.get('categories', []),
@@ -295,11 +431,61 @@ class OfficeMailHandler:
             confidential_level=email.get('sensitivity', 'normal').lower(),
             attachments=attachments,
             flag_state='flagged' if email.get('flag', {}).get('flagStatus', 'notFlagged') else 'notFlagged',
-            web_link=email.get('webLink', None)
+            web_link=web_link,
+            outlook_url=web_link,
+            event_id=event.get('id'),
         )
         return new_mail
 
-    def _build_mail_url(self, email_id: Optional[str] = None, url: Optional[str] = None, attachments: bool = True) -> str:
+    async def _resolve_smtp_by_name_async(self, name: str | None) -> str | None:
+        """Best-effort directory lookup mapping a display name to its SMTP
+        address, used to repair legacy Exchange-DN senders. Cached per process;
+        returns None (and caches it) when the directory can't be queried (e.g.
+        the app lacks User.Read.All) so a failure never breaks mail parsing."""
+        if not name:
+            return None
+        if name in self._dn_smtp_cache:
+            return self._dn_smtp_cache[name]
+        smtp: str | None = None
+        try:
+            token = await self.msg.get_access_token_async()
+            if token:
+                safe = name.replace("'", "''")
+                url = (
+                    f"{self.msg.msg_endpoint}users?$filter=displayName eq '{safe}'"
+                    f"&$select=mail,userPrincipalName&$top=2"
+                )
+                resp = await self.msg.run_async(url=url, token=token)
+                if resp is not None and getattr(resp, "status_code", 0) == 200:
+                    vals = resp.json().get("value", [])
+                    if len(vals) == 1:
+                        smtp = vals[0].get("mail") or vals[0].get("userPrincipalName")
+        except Exception:
+            smtp = None
+        self._dn_smtp_cache[name] = smtp
+        return smtp
+
+    async def resolve_legacy_addresses_async(self, mails: list[OfficeMail]) -> None:
+        """Repair legacy Exchange-DN sender/recipient addresses in-place by
+        resolving their display names to SMTP. Bounded by unique names (cached)
+        and best-effort — unresolved entries keep the original DN."""
+        for m in mails:
+            if _is_legacy_dn(m.from_email) and m.from_name:
+                if smtp := await self._resolve_smtp_by_name_async(m.from_name):
+                    m.from_email = smtp
+            if _is_legacy_dn(m.sender_email) and m.sender_name:
+                if smtp := await self._resolve_smtp_by_name_async(m.sender_name):
+                    m.sender_email = smtp
+            for addr in (*m.to_recipients, *m.cc_recipients,
+                         *m.bcc_recipients, *m.reply_to):
+                if addr.legacy_dn and not addr.address and addr.name:
+                    if smtp := await self._resolve_smtp_by_name_async(addr.name):
+                        addr.address = smtp
+
+    def _build_mail_url(
+        self, email_id: Optional[str] = None, url: Optional[str] = None,
+        attachments: bool = True, *, include_body: bool = True,
+    ) -> str:
         if not url and not email_id:
             raise ValueError("Either email_id or url must be provided")
         if url is not None:
@@ -313,11 +499,16 @@ class OfficeMailHandler:
                 raise ValueError("URL must point to the MS Graph API endpoint")
         else:
             url = f"{self.msg.msg_endpoint}me/messages/{email_id}"
+
+        def _add(param: str) -> None:
+            nonlocal url
+            url += ('&' if '?' in url else '?') + param
+
+        # Skip the (potentially huge) body by projecting header fields only.
+        if not include_body:
+            _add(f"$select={_NO_BODY_SELECT}")
         if attachments:
-            if '?' in url:
-                url += '&$expand=attachments'
-            else:
-                url += '?$expand=attachments'
+            _add("$expand=attachments")
         return url
 
     def _build_message_payload(
@@ -367,17 +558,51 @@ class OfficeMailHandler:
             return None
         return response.json()
 
+    # Index/search projection: header metadata only — never the full body,
+    # which is fetched on demand via get_mail/get_mails to avoid context blowups.
+    _INDEX_FIELDS = (
+        "id,from,sender,toRecipients,ccRecipients,subject,bodyPreview,"
+        "receivedDateTime,isRead,hasAttachments,categories,importance,"
+        "conversationId,internetMessageId,webLink,parentFolderId"
+    )
+
+    async def _resolve_folder_id_async(self, name: str | None) -> str | None:
+        """Resolve a well-known/friendly folder name to its real folder id
+        (needed to match parentFolderId for exclusion). Cached per process."""
+        token_name = resolve_well_known_folder(name)
+        if not token_name:
+            return None
+        if token_name in self._folder_id_cache:
+            return self._folder_id_cache[token_name]
+        resolved = token_name
+        try:
+            tok = await self.msg.get_access_token_async()
+            if tok:
+                url = f"{self.msg.msg_endpoint}me/mailFolders/{token_name}?$select=id"
+                resp = await self.msg.run_async(url=url, token=tok)
+                if resp is not None and getattr(resp, "status_code", 0) == 200:
+                    resolved = resp.json().get("id", token_name)
+        except Exception:
+            resolved = token_name
+        self._folder_id_cache[token_name] = resolved
+        return resolved
+
     async def email_index_async(
         self, limit: int = 40, skip: int = 0, *,
         mail_address: Optional[str] = None,
         folder_id: str | None = None,
+        folder: str | None = None,
+        exclude_folders: list[str] | None = None,
         query: str | None = None,
     ) -> OfficeMailList:
-        """List or search messages.
+        """List or search messages (header metadata only — no full body).
 
-        When *query* is provided, performs a full-text ``$search`` across
-        all folders (``folder_id`` is ignored).  Otherwise lists messages
-        in the given folder (defaults to Inbox).
+        *folder* / *folder_id* accept a well-known name (inbox, sent,
+        deleteditems, junk, archive, …) or a folder id and scope BOTH listing
+        and search to that folder. *exclude_folders* drops results whose parent
+        folder matches (client-side; may return fewer than *limit*). When
+        *query* is set a full-text ``$search`` runs (within *folder* if given,
+        else mailbox-wide).
         """
         if mail_address is None:
             mail_address = self.msg.email
@@ -386,20 +611,30 @@ class OfficeMailHandler:
             return OfficeMailList()
 
         base = "me" if not mail_address or mail_address == self.msg.email else f"users/{mail_address}"
+        scope_folder = resolve_well_known_folder(folder or folder_id)
+
+        # Resolve exclusion folder names to real ids for parentFolderId matching.
+        exclude_ids: set[str] = set()
+        if exclude_folders:
+            for name in exclude_folders:
+                fid = await self._resolve_folder_id_async(name)
+                if fid:
+                    exclude_ids.add(fid)
+        # Over-fetch when excluding so client-side drops still fill the page.
+        fetch_top = min(limit * 3, 250) if exclude_ids else limit
 
         if query is not None:
             safe_q = query.replace('"', '\\"')
-            fields = "id,from,subject,bodyPreview,receivedDateTime,isRead,hasAttachments,categories,importance"
+            container = f"mailFolders/{scope_folder}/messages" if scope_folder else "messages"
             url = (
-                f'{self.msg.msg_endpoint}{base}/messages'
-                f'?$search="{safe_q}"&$select={fields}&$top={limit}'
+                f'{self.msg.msg_endpoint}{base}/{container}'
+                f'?$search="{safe_q}"&$select={self._INDEX_FIELDS}&$top={fetch_top}'
             )
         else:
-            fields = "isRead,id,from,subject,bodyPreview,receivedDateTime,hasAttachments,categories,importance,webLink"
-            folder = folder_id or "inbox"
+            folder_token = scope_folder or "inbox"
             url = (
-                f"{self.msg.msg_endpoint}{base}/mailFolders/{folder}/messages"
-                f"?$select={fields}&$top={limit}&$skip={skip}"
+                f"{self.msg.msg_endpoint}{base}/mailFolders/{folder_token}/messages"
+                f"?$select={self._INDEX_FIELDS}&$top={fetch_top}&$skip={skip}"
                 f"&$orderby=receivedDateTime desc&$count=true"
             )
 
@@ -412,22 +647,162 @@ class OfficeMailHandler:
         email_list = []
         end_point = (self.msg.msg_endpoint or "").rstrip('/')
         for email in emails:
+            if exclude_ids and email.get("parentFolderId") in exclude_ids:
+                continue
             new_mail = self.parse_mail(email)
             new_mail.email_url = f"{end_point}/{base}/messages/{new_mail.email_id}"
+            new_mail.graph_url = new_mail.email_url
             email_list.append(new_mail)
+            if len(email_list) >= limit:
+                break
 
+        await self.resolve_legacy_addresses_async(email_list)
         return OfficeMailList(elements=email_list, total_mails=total_count)
 
-    async def get_mail_async(self, email_id: Optional[str] = None, email_url: Optional[str] = None, attachments=True) -> OfficeMail | None:
+    async def get_mail_async(
+        self, email_id: Optional[str] = None, email_url: Optional[str] = None,
+        attachments=True, *,
+        body_format: str = "html",
+        max_body_chars: int | None = None,
+    ) -> OfficeMail | None:
+        """Fetch a single message.
+
+        *body_format*: 'html' (default), 'text' (request Graph's plain-text
+        body via Prefer), or 'none' (skip the body, keeping bodyPreview only).
+        *max_body_chars*: truncate the body, setting body_truncated=True.
+        """
         access_token = await self.msg.get_access_token_async()
         if not access_token:
             return None
-        url = self._build_mail_url(email_id, email_url, attachments)
-        response = await self.msg.run_async(url=url, token=access_token)
+        include_body = body_format != "none"
+        url = self._build_mail_url(
+            email_id, email_url, attachments, include_body=include_body,
+        )
+        add_headers = None
+        if body_format == "text":
+            add_headers = {"Prefer": 'outlook.body-content-type="text"'}
+        response = await self.msg.run_async(
+            url=url, token=access_token, add_headers=add_headers,
+        )
         if response is None or response.status_code != 200:
             return None
-        email = response.json()
-        return self.parse_mail(email)
+        mail = self.parse_mail(response.json())
+        end_point = (self.msg.msg_endpoint or "").rstrip('/')
+        if mail.email_id:
+            mail.graph_url = f"{end_point}/me/messages/{mail.email_id}"
+            mail.email_url = mail.graph_url
+        # Meeting-request messages link a calendar event; fetch its id so the
+        # caller can hand it to o365_get_events. Bounded to eventMessage types.
+        if not mail.event_id and "eventmessage" in (mail.email_type or "").lower() and mail.email_id:
+            mail.event_id = await self._fetch_event_id_async(mail.email_id, access_token)
+        # Always provide a plain-text rendering when we have an HTML body.
+        if mail.body_text is None and mail.body_type == "html":
+            mail.body_text = _html_to_text(mail.body)
+        _apply_body_limit(mail, max_body_chars)
+        await self.resolve_legacy_addresses_async([mail])
+        return mail
+
+    async def reply_async(
+        self, email_id: str, body: str, *, reply_all: bool = False,
+    ) -> bool:
+        """Reply (or reply-all) to a message and send immediately. Uses Graph's
+        one-shot reply action so the quoted original and threading are kept; the
+        body is added as a plain-text comment above the quote."""
+        access_token = await self.msg.get_access_token_async()
+        if not access_token:
+            return False
+        action = "replyAll" if reply_all else "reply"
+        url = f"{self.msg.msg_endpoint}me/messages/{email_id}/{action}"
+        resp = await self.msg.run_async(
+            url=url, method="POST", json={"comment": body}, token=access_token,
+        )
+        return resp is not None and getattr(resp, "status_code", 0) in (200, 202)
+
+    async def forward_async(
+        self, email_id: str, to_recipients: List[str], comment: str = "",
+    ) -> bool:
+        """Forward a message to new recipients and send immediately."""
+        access_token = await self.msg.get_access_token_async()
+        if not access_token or not to_recipients:
+            return False
+        payload = {
+            "comment": comment or "",
+            "toRecipients": [{"emailAddress": {"address": a}} for a in to_recipients],
+        }
+        url = f"{self.msg.msg_endpoint}me/messages/{email_id}/forward"
+        resp = await self.msg.run_async(
+            url=url, method="POST", json=payload, token=access_token,
+        )
+        return resp is not None and getattr(resp, "status_code", 0) in (200, 202)
+
+    async def _fetch_event_id_async(self, email_id: str, token: str) -> str | None:
+        """Best-effort: resolve the linked calendar event id for a meeting
+        message via ``$expand=event``. None if unavailable."""
+        try:
+            url = f"{self.msg.msg_endpoint}me/messages/{email_id}?$expand=event($select=id)"
+            resp = await self.msg.run_async(url=url, token=token)
+            if resp is not None and getattr(resp, "status_code", 0) == 200:
+                return (resp.json().get("event") or {}).get("id")
+        except Exception:
+            return None
+        return None
+
+    async def get_mails_async(
+        self, email_ids: list[str], *,
+        body_format: str = "html",
+        max_body_chars: int | None = None,
+        attachments: bool = False,
+    ) -> list[OfficeMail]:
+        """Batch-fetch multiple messages in a single round trip via Graph
+        ``$batch`` (chunked at 20, Graph's per-request limit). Returns the
+        successfully-fetched messages in input order; missing/failed ids are
+        skipped. Defaults attachments=False to keep batch payloads small."""
+        access_token = await self.msg.get_access_token_async()
+        if not access_token or not email_ids:
+            return []
+        include_body = body_format != "none"
+        prefer = 'outlook.body-content-type="text"' if body_format == "text" else None
+        end_point = (self.msg.msg_endpoint or "").rstrip('/')
+        by_id: dict[str, OfficeMail] = {}
+
+        for start in range(0, len(email_ids), 20):
+            chunk = email_ids[start:start + 20]
+            requests = []
+            for i, mid in enumerate(chunk):
+                rel = f"/me/messages/{mid}"
+                params = []
+                if attachments:
+                    params.append("$expand=attachments")
+                if not include_body:
+                    params.append(f"$select={_NO_BODY_SELECT}")
+                if params:
+                    rel += "?" + "&".join(params)
+                req = {"id": str(i), "method": "GET", "url": rel}
+                if prefer:
+                    req["headers"] = {"Prefer": prefer}
+                requests.append(req)
+            resp = await self.msg.run_async(
+                url=f"{self.msg.msg_endpoint}$batch",
+                method="POST", json={"requests": requests}, token=access_token,
+            )
+            if resp is None or resp.status_code != 200:
+                continue
+            for sub in resp.json().get("responses", []):
+                if sub.get("status") != 200 or not sub.get("body"):
+                    continue
+                mail = self.parse_mail(sub["body"])
+                if not mail.email_id:
+                    continue
+                mail.graph_url = f"{end_point}/me/messages/{mail.email_id}"
+                mail.email_url = mail.graph_url
+                if mail.body_text is None and mail.body_type == "html":
+                    mail.body_text = _html_to_text(mail.body)
+                _apply_body_limit(mail, max_body_chars)
+                by_id[mail.email_id] = mail
+
+        ordered = [by_id[mid] for mid in email_ids if mid in by_id]
+        await self.resolve_legacy_addresses_async(ordered)
+        return ordered
 
     async def set_mail_categories_async(self, email_url: str, categories: list[str]) -> bool:
         access_token = await self.msg.get_access_token_async()

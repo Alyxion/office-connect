@@ -22,7 +22,7 @@ Central class in `office_con/msgraph/ms_graph_handler.py`. Manages OAuth tokens 
 ```
 MsGraphInstance (inherits WebUserInstance)
   ├── ProfileHandler     — /me
-  ├── OfficeMailHandler  — /me/mailFolders, /me/messages, /me/sendMail
+  ├── OfficeMailHandler  — /me/mailFolders, /me/messages, /me/sendMail, reply/forward, $batch
   ├── CalendarHandler    — /me/calendars, calendarView, getSchedule
   ├── DirectoryHandler   — /users, manager, photos
   ├── TeamsHandler       — /me/joinedTeams, channels, messages
@@ -37,6 +37,8 @@ Stdio-based. Entry: `office-connect --keyfile path/to/token.json`. Defers graph 
 **Hot keyfile reload.** Before each tool call, the server compares `mtime(keyfile)` against the value captured when the cached graph was built; if it changed, the graph is rebuilt from the new file contents. Clients (Claude Desktop, etc.) do not need to restart after a token refresh.
 
 **Self-healing token refresh.** During a session the MCP refreshes the access token automatically: `MsGraphInstance.get_access_token_async` runs a proactive refresh when the cached token has under 15 minutes of life left, and `run_async` does a reactive refresh-and-retry on a 401 from Graph. Every successful in-process refresh is written back to the keyfile (`_create_graph` wraps `refresh_token_async` with a persister), so a process restart never loads stale credentials.
+
+**Loud auth failures (no silent empties).** When a 401 *cannot* be recovered — no refresh capability, refresh token missing/expired/revoked, or Graph still 401s after a successful refresh — `run_async` raises `AuthExpiredError` instead of returning the 401 for handlers to quietly turn into an empty `UserProfile()`/`[]`. `call_tool` catches it (and pre-flights the no-token-at-all cold start) and returns a clear `⚠️ Office 365 authentication…` message naming the fix: run `office-connect login`. The server's MCP `instructions` tell the assistant to treat that message as a dead session rather than real (empty) data. This is what stops the client from reporting "0 mails / profile null" as if the mailbox were genuinely empty. A dedicated read-only `o365_check_connection` tool probes `/me` and returns `{connected: true, email, display_name}` when healthy, or the same re-auth message when not — call it first when the user asks "are you still connected?" or when results look suspiciously empty. Tests: `tests/test_auth_errors.py`.
 
 **Fresh sign-in via the CLI.** When you have neither an access nor a refresh token (truly cold start), use the device-code login:
 
@@ -130,6 +132,17 @@ Available: `PROFILE_SCOPE`, `MAIL_SCOPE`, `CALENDAR_SCOPE`, `CHAT_SCOPE`, `ONE_D
 ```
 
 Use `export_keyfile()` from `mcp_server.py` to write with 0600 permissions.
+
+### Mail data model (`OfficeMail`)
+
+`parse_mail()` populates recipient/header metadata so agents can thread and filter without extra round-trips: `to_recipients` / `cc_recipients` / `bcc_recipients` / `reply_to` / `sender_*` (lists of `MailAddress`), `conversation_id` (pull a whole thread via search), and `internet_message_id` (RFC-822, for deduping forward chains). These ride on **list/search results too** — `email_index_async` selects them (`_INDEX_FIELDS`); list/search never fetch the full body (use `get_mail`/`get_mails`).
+
+- **URL fields:** `graph_url` (API) and `outlook_url` (human-openable) are the clear names; `email_url` is kept as a deprecated alias of `graph_url`, `web_link` as the original of `outlook_url`.
+- **Body hygiene:** `get_mail_async(body_format="text"|"html"|"none", max_body_chars=…)`. `body_text` is always provided (HTML stripped via BeautifulSoup); over-limit bodies are cut with `body_truncated=True`. The MCP tools default to `body_format="text"`, `max_body_chars=50000` to avoid context blowups; the library default is no limit (back-compat).
+- **Batch:** `get_mails_async(ids, …)` pulls many messages in one Graph `$batch` (chunked at 20), preserving input order.
+- **Folder scoping:** `folder=` (well-known name via `resolve_well_known_folder` — inbox/sent/deleteditems/junk/archive/… — or id) scopes list+search; `exclude_folders=` drops by parentFolderId (client-side, may return fewer than `limit`).
+- **Legacy EX-DN:** `_is_legacy_dn` detects X500/Exchange DNs; `resolve_legacy_addresses_async` best-effort resolves them to SMTP via a cached directory lookup by display name (silently keeps the DN if directory scope is absent). Recipient-level DNs are isolated into `MailAddress.legacy_dn`.
+- **Meeting requests:** `event_id` links an `eventMessageRequest` to its calendar event (fetched via `$expand=event` on get) — hand it to `o365_get_events`.
 
 ### MS Graph Timestamps
 

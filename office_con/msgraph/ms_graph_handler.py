@@ -19,6 +19,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class AuthExpiredError(RuntimeError):
+    """Raised when Microsoft Graph rejects the session and it cannot be
+    recovered by refreshing — i.e. the user must re-authenticate.
+
+    Surfacing this as an exception (instead of letting handlers silently
+    return empty results) lets the MCP layer tell the client exactly what is
+    wrong and how to fix it: run ``office-connect login``.
+    """
+
+
 class MsGraphInstance(WebUserInstance):
 
     def __init__(self, scopes: list[str] | None = None,
@@ -122,7 +132,14 @@ class MsGraphInstance(WebUserInstance):
 
     async def run_async(self, *, url, method="GET", json=None, token=None, add_headers=None):
         """Send a Graph request. Retries once after a refresh if the server
-        rejects the cached token with 401."""
+        rejects the cached token with 401.
+
+        Raises :class:`AuthExpiredError` when a 401 cannot be recovered — no
+        refresh capability, the refresh token is gone/invalid, or Graph still
+        rejects the freshly-refreshed token. Raising (instead of returning the
+        401 for handlers to quietly turn into empty results) is what lets the
+        MCP layer report a clear "re-authenticate" message to the client.
+        """
         if token is None:
             token = await self.get_access_token_async()
 
@@ -130,22 +147,48 @@ class MsGraphInstance(WebUserInstance):
             url=url, method=method, json=json, token=token, add_headers=add_headers,
         )
 
-        if (
-            response is None
-            or getattr(response, "status_code", 0) != 401
-            or not self.can_refresh
-        ):
+        # Absorb transient hiccups (a dropped connection during a token-refresh
+        # race, or a brief Graph 5xx) with one short retry, so the first call
+        # after a cold start doesn't surface a spurious empty result.
+        if response is None or getattr(response, "status_code", 0) in (502, 503, 504):
+            await asyncio.sleep(0.1)
+            if token is None:
+                token = await self.get_access_token_async()
+            response = await super().run_async(
+                url=url, method=method, json=json, token=token, add_headers=add_headers,
+            )
+
+        if response is None or getattr(response, "status_code", 0) != 401:
             return response
+
+        # Graph rejected the token. Attempt one refresh-and-retry if we can;
+        # otherwise the session is unrecoverable and the user must re-auth.
+        if not self.can_refresh:
+            raise AuthExpiredError(
+                "Microsoft Graph rejected the access token (HTTP 401) and this "
+                "session is configured without refresh capability."
+            )
 
         async with self._refresh_lock:
             new_token = await self.refresh_token_async()
         if not new_token or new_token == token:
-            return response
+            raise AuthExpiredError(
+                "Microsoft Graph rejected the access token (HTTP 401) and it "
+                "could not be refreshed — the refresh token is missing, "
+                "expired, or has been revoked."
+            )
 
         logger.info("[OP] run_async — refreshed after 401, retrying %s", url[:80])
-        return await super().run_async(
+        retry = await super().run_async(
             url=url, method=method, json=json, token=new_token, add_headers=add_headers,
         )
+        if retry is not None and getattr(retry, "status_code", 0) == 401:
+            raise AuthExpiredError(
+                "Microsoft Graph returned HTTP 401 even after a successful "
+                "token refresh — the account may have revoked access or the "
+                "app's permissions/consent changed."
+            )
+        return retry
 
     async def acquire_token_async(self, code, redirect_url: str):
         _pid = os.getpid()
