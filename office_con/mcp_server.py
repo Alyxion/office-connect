@@ -42,6 +42,11 @@ from office_con.mcp_permissions import (
     resolve_level,
 )
 from office_con.msgraph.ms_graph_handler import AuthExpiredError, MsGraphInstance
+from office_con.logging_setup import (
+    LOG_FILE_ENV,
+    LOG_LEVEL_ENV,
+    configure_logging,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -840,7 +845,13 @@ TOOLS = [
     ),
     Tool(
         name="o365_search_files",
-        description="Search for files by name or content in OneDrive.",
+        description=(
+            "Search files by name or content across the user's OneDrive AND every "
+            "SharePoint document library they can access (tenant-wide, via Microsoft "
+            "Search) — the same corpus as the OneDrive/SharePoint web UI. Each hit "
+            "carries a 'drive_id'; pass it (with the item 'id') to o365_peek_drive_file "
+            "or o365_get_file_content to open results that live in SharePoint sites."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
@@ -2018,10 +2029,16 @@ async def _handle_tool(
             method="POST", json=body, token=token,
         )
         if resp is None or resp.status_code != 200:
+            status = resp.status_code if resp else "no response"
+            if resp is not None and resp.status_code == 429:
+                hint = ("Microsoft Graph is throttling search (HTTP 429) after "
+                        "repeated/intensive queries. Wait a few seconds and retry, "
+                        "or widen the query so fewer calls are needed.")
+            else:
+                hint = "Missing Chat.Read or ChannelMessage.Read.All scope is a common cause."
             return [TextContent(
                 type="text",
-                text=f"Message search failed: status={resp.status_code if resp else 'no response'}. "
-                     "Missing Chat.Read or ChannelMessage.Read.All scope is a common cause.",
+                text=f"Message search failed: status={status}. {hint}",
             )]
         hits = []
         for container in resp.json().get("value", []):
@@ -2403,6 +2420,15 @@ def create_server(
         except AuthExpiredError as exc:
             logger.warning("[MCP] auth expired on tool %s: %s", name, exc)
             return [TextContent(type="text", text=_auth_error_text(str(exc)))]
+        except (asyncio.TimeoutError, TimeoutError):
+            logger.warning("[MCP] tool %s timed out", name)
+            return [TextContent(
+                type="text",
+                text=(f"⏱️ Tool '{name}' timed out talking to Microsoft Graph. "
+                      "The request was aborted rather than hanging the session — "
+                      "retry, or narrow the request (e.g. a more specific query "
+                      "or a smaller limit)."),
+            )]
         except Exception:
             logger.exception("Tool %s failed", name)
             return [TextContent(type="text", text=f"Error: tool '{name}' failed. Check server logs for details.")]
@@ -2838,6 +2864,10 @@ For more help on a subcommand:
 
 def cli() -> None:
     """CLI entry point for the MCP server."""
+    # Default file logging for every path (subcommands included). The server
+    # branch re-configures with its own --log-file/--log-level flags below;
+    # configure_logging is idempotent.
+    configure_logging()
     if len(sys.argv) >= 2 and sys.argv[1] == "import-token":
         return _cli_import_token(sys.argv[2:])
     if len(sys.argv) >= 2 and sys.argv[1] == "login":
@@ -2893,7 +2923,22 @@ def cli() -> None:
             "(os.pathsep-separated)."
         ),
     )
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        help=(
+            "Path for the rotating, secret-redacting log file. Defaults to "
+            f"${LOG_FILE_ENV} or ~/.config/office-connect/logs/office-connect.log. "
+            "Pass 'none' to disable file logging."
+        ),
+    )
+    parser.add_argument(
+        "--log-level",
+        default=None,
+        help=f"Log level (DEBUG/INFO/WARNING/...). Default ${LOG_LEVEL_ENV} or INFO.",
+    )
     parsed = parser.parse_args()
+    configure_logging(parsed.log_file, parsed.log_level)
     try:
         level = resolve_level(parsed.permission_level, policy_file=parsed.policy_file)
         roots = _parse_attachment_roots(parsed.attachment_root)

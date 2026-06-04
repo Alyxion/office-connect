@@ -18,6 +18,45 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Throttling (HTTP 429) handling for run_async. Graph throttles /search/query
+# and other endpoints aggressively under bursty/intensive use; without honoring
+# Retry-After the call surfaces a misleading "search failed" to the user.
+_MAX_THROTTLE_RETRIES = 3
+_THROTTLE_WAIT_CAP_S = 10.0  # never sleep longer than this per retry — a huge
+# Retry-After is treated as "give up" rather than re-introducing a long hang.
+
+
+def _redact_url(url: str) -> str:
+    """Strip the query string (and fragment) from a Graph URL before logging.
+
+    Query strings carry user content — ``$search="<name>"``, ``$filter`` with
+    email addresses, item ids — so only the scheme+host+path is log-safe.
+    """
+    if not url:
+        return url
+    for sep in ("?", "#"):
+        idx = url.find(sep)
+        if idx != -1:
+            url = url[:idx]
+    return url
+
+
+def _parse_retry_after(headers, attempt: int) -> float:
+    """Seconds to wait before retrying a 429. Honors the ``Retry-After`` header
+    (delta-seconds form) when present and sane; otherwise falls back to bounded
+    exponential backoff. Always clamped to ``_THROTTLE_WAIT_CAP_S``."""
+    raw = None
+    try:
+        raw = headers.get("Retry-After") if headers else None
+    except Exception:
+        raw = None
+    if raw is not None:
+        try:
+            return min(max(float(raw), 0.0), _THROTTLE_WAIT_CAP_S)
+        except (ValueError, TypeError):
+            pass
+    return min(0.5 * (2 ** attempt), _THROTTLE_WAIT_CAP_S)
+
 
 class AuthExpiredError(RuntimeError):
     """Raised when Microsoft Graph rejects the session and it cannot be
@@ -158,6 +197,26 @@ class MsGraphInstance(WebUserInstance):
                 url=url, method=method, json=json, token=token, add_headers=add_headers,
             )
 
+        # Throttling: Graph returns 429 under intensive/bursty use (notably
+        # /search/query). Honor Retry-After with a few bounded retries so an
+        # intensive search recovers instead of surfacing a misleading failure.
+        attempt = 0
+        while (
+            response is not None
+            and getattr(response, "status_code", 0) == 429
+            and attempt < _MAX_THROTTLE_RETRIES
+        ):
+            wait = _parse_retry_after(getattr(response, "headers", None), attempt)
+            logger.warning(
+                "[OP] run_async — throttled (429) on %s, retry %d/%d after %.1fs",
+                _redact_url(url), attempt + 1, _MAX_THROTTLE_RETRIES, wait,
+            )
+            await asyncio.sleep(wait)
+            response = await super().run_async(
+                url=url, method=method, json=json, token=token, add_headers=add_headers,
+            )
+            attempt += 1
+
         if response is None or getattr(response, "status_code", 0) != 401:
             return response
 
@@ -178,7 +237,7 @@ class MsGraphInstance(WebUserInstance):
                 "expired, or has been revoked."
             )
 
-        logger.info("[OP] run_async — refreshed after 401, retrying %s", url[:80])
+        logger.info("[OP] run_async — refreshed after 401, retrying %s", _redact_url(url))
         retry = await super().run_async(
             url=url, method=method, json=json, token=new_token, add_headers=add_headers,
         )
