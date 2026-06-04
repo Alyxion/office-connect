@@ -46,6 +46,8 @@ class DriveItem(BaseModel):
     is_folder: bool = Field(default=False, description="True if item is a folder")
     folder_child_count: Optional[int] = Field(default=None, description="Number of children (folders only)")
     download_url: Optional[str] = Field(default=None, description="Pre-authenticated download URL (short-lived)")
+    drive_id: Optional[str] = Field(default=None, description="ID of the drive that holds this item (needed to fetch/download items found via tenant-wide search, since they may live in SharePoint libraries rather than the user's OneDrive)")
+    parent_path: Optional[str] = Field(default=None, description="Path of the parent folder (from parentReference)")
 
 
 class DriveItemList(BaseModel):
@@ -142,6 +144,7 @@ class FilesHandler:
     def _parse_drive_item(data: dict) -> DriveItem:
         folder = data.get("folder")
         file_info = data.get("file") or {}
+        parent = data.get("parentReference") or {}
         return DriveItem(
             id=data["id"],
             name=data.get("name"),
@@ -155,6 +158,8 @@ class FilesHandler:
             is_folder=folder is not None,
             folder_child_count=folder.get("childCount") if folder else None,
             download_url=data.get("@microsoft.graph.downloadUrl"),
+            drive_id=parent.get("driveId"),
+            parent_path=parent.get("path"),
         )
 
     @staticmethod
@@ -275,22 +280,59 @@ class FilesHandler:
     ) -> DriveItemList:
         """Search for files and folders by name or content.
 
-        If ``drive_id`` is None, searches the current user's default OneDrive.
+        When ``drive_id`` is given, the search is scoped to that single drive
+        via the per-drive ``search(q=…)`` endpoint.
+
+        When ``drive_id`` is None (the default), the search is **tenant-wide**:
+        it uses the unified Microsoft Search API (``POST /search/query`` with
+        ``entityTypes: ["driveItem"]``), which spans the user's OneDrive *and*
+        every SharePoint document library they have access to — the same corpus
+        the OneDrive/SharePoint web UI searches. The old behaviour scoped this
+        to ``/me/drive`` only, so files living in SharePoint sites (and content
+        the user could otherwise open in the browser) were never found, and an
+        unmatched term surfaced loosely-ranked personal files instead of an
+        empty result.
         """
         token = await self.msg.get_access_token_async()
         if not token:
             return DriveItemList()
-        safe_query = query.replace("'", "''")
+
         if drive_id:
+            safe_query = query.replace("'", "''")
             url = f"{self.msg.msg_endpoint}drives/{drive_id}/root/search(q='{safe_query}')?$top={limit}"
-        else:
-            url = f"{self.msg.msg_endpoint}me/drive/root/search(q='{safe_query}')?$top={limit}"
-        resp = await self.msg.run_async(url=url, token=token)
+            resp = await self.msg.run_async(url=url, token=token)
+            if resp is None or resp.status_code != 200:
+                return DriveItemList()
+            data = resp.json()
+            items = [self._parse_drive_item(i) for i in data.get("value", [])]
+            return DriveItemList(items=items, total_items=len(items))
+
+        # Tenant-wide unified search (OneDrive + SharePoint libraries).
+        body = {
+            "requests": [{
+                "entityTypes": ["driveItem"],
+                "query": {"queryString": query},
+                "from": 0,
+                "size": limit,
+            }]
+        }
+        resp = await self.msg.run_async(
+            url=f"{self.msg.msg_endpoint}search/query",
+            method="POST", json=body, token=token,
+        )
         if resp is None or resp.status_code != 200:
             return DriveItemList()
-        data = resp.json()
-        items = [self._parse_drive_item(i) for i in data.get("value", [])]
-        return DriveItemList(items=items, total_items=len(items))
+        items: List[DriveItem] = []
+        total = 0
+        for container in resp.json().get("value", []):
+            for hits_container in container.get("hitsContainers", []):
+                total = hits_container.get("total", total)
+                for hit in hits_container.get("hits", []):
+                    resource = hit.get("resource")
+                    if resource:
+                        items.append(self._parse_drive_item(resource))
+        # Fall back to the parsed-hit count when the API omits ``total``.
+        return DriveItemList(items=items, total_items=total or len(items))
 
     # ── async API — SharePoint sites ──────────────────────────────────────
 

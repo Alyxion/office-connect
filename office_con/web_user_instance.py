@@ -402,7 +402,13 @@ class WebUserInstance:
                 if self.status_code >= 400:
                     raise Exception(f"HTTP Error: {self.status_code}")
         
-        async with aiohttp.ClientSession() as session:
+        # Bound every Graph request. Without this, aiohttp applies its 5-minute
+        # default total timeout, so a single slow/stuck request blocks the whole
+        # stdio MCP event loop for minutes and makes the server appear hung.
+        # ``sock_connect`` fails fast on an unreachable host; ``total`` caps the
+        # full request (including a large file download or a heavy search).
+        request_timeout = aiohttp.ClientTimeout(total=60, sock_connect=10)
+        async with aiohttp.ClientSession(timeout=request_timeout) as session:
             if method == "POST":
                 async with session.post(url, headers=headers, json=json) as response:
                     content = await response.read()
