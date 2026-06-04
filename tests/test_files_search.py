@@ -38,6 +38,20 @@ def _graph_with_capture(payload: dict, status_code: int = 200):
     return g, calls
 
 
+def _graph_with_sequence(responses: list[_FakeResponse]):
+    """Build a graph whose run_async returns one prepared response per call."""
+    g = MsGraphInstance(endpoint="https://graph.microsoft.com/v1.0/")
+    g.cache_dict["access_token"] = "fake-token"
+    calls: list[dict] = []
+
+    async def fake_run_async(*, url, method="GET", json=None, token=None, add_headers=None):
+        calls.append({"url": url, "method": method, "json": json})
+        return responses.pop(0)
+
+    g.run_async = fake_run_async  # type: ignore[assignment]
+    return g, calls
+
+
 _UNIFIED_HIT = {
     "value": [{
         "hitsContainers": [{
@@ -105,3 +119,30 @@ async def test_search_empty_result_is_empty_not_fallback():
 
     assert result.total_items == 0
     assert result.items == []
+
+
+@pytest.mark.asyncio
+async def test_search_falls_back_to_personal_onedrive_when_unified_search_fails():
+    fallback_payload = {
+        "value": [{
+            "id": "OD_ITEM",
+            "name": "report.docx",
+            "parentReference": {"driveId": "DRIVE_PERSONAL"},
+        }]
+    }
+    graph, calls = _graph_with_sequence([
+        _FakeResponse(403, {"error": {"code": "accessDenied"}}),
+        _FakeResponse(200, fallback_payload),
+    ])
+    handler = FilesHandler(graph)
+
+    result = await handler.search_items_async("report", limit=5)
+
+    assert len(calls) == 2
+    assert calls[0]["url"].endswith("search/query")
+    assert calls[0]["method"] == "POST"
+    assert calls[1]["method"] == "GET"
+    assert "me/drive/root/search(q='report')" in calls[1]["url"]
+    assert result.total_items == 1
+    assert result.items[0].id == "OD_ITEM"
+    assert result.items[0].drive_id == "DRIVE_PERSONAL"

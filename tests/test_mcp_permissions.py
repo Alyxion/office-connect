@@ -116,7 +116,8 @@ class TestToolClassification:
         assert TOOL_PERMISSIONS["o365_update_mail_draft"] is PermissionLevel.DRAFTS
 
     def test_sending_is_all_tier(self):
-        for name in ("o365_send_mail", "o365_send_mail_draft"):
+        for name in ("o365_send_mail", "o365_send_mail_draft",
+                     "o365_reply_to_mail", "o365_forward_mail"):
             assert TOOL_PERMISSIONS[name] is PermissionLevel.ALL
 
     def test_destructive_mail_ops_are_all_tier(self):
@@ -125,7 +126,9 @@ class TestToolClassification:
             assert TOOL_PERMISSIONS[name] is PermissionLevel.ALL
 
     def test_create_event_is_all_tier(self):
-        assert TOOL_PERMISSIONS["o365_create_event"] is PermissionLevel.ALL
+        for name in ("o365_create_event", "o365_update_event",
+                     "o365_send_event_invite"):
+            assert TOOL_PERMISSIONS[name] is PermissionLevel.ALL
 
 
 # ---------------------------------------------------------------------------
@@ -171,16 +174,20 @@ class TestRequireAllowed:
         _require_allowed("o365_create_mail_draft", PermissionLevel.DRAFTS)
 
     def test_drafts_denies_send(self):
-        with pytest.raises(PermissionDenied):
-            _require_allowed("o365_send_mail", PermissionLevel.DRAFTS)
+        for name in ("o365_send_mail", "o365_send_mail_draft",
+                     "o365_reply_to_mail", "o365_forward_mail"):
+            with pytest.raises(PermissionDenied):
+                _require_allowed(name, PermissionLevel.DRAFTS)
 
     def test_drafts_denies_delete(self):
         with pytest.raises(PermissionDenied):
             _require_allowed("o365_delete_mail", PermissionLevel.DRAFTS)
 
     def test_drafts_denies_create_event(self):
-        with pytest.raises(PermissionDenied):
-            _require_allowed("o365_create_event", PermissionLevel.DRAFTS)
+        for name in ("o365_create_event", "o365_update_event",
+                     "o365_send_event_invite"):
+            with pytest.raises(PermissionDenied):
+                _require_allowed(name, PermissionLevel.DRAFTS)
 
     def test_all_allows_send(self):
         _require_allowed("o365_send_mail", PermissionLevel.ALL)

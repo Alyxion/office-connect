@@ -321,7 +321,17 @@ class FilesHandler:
             method="POST", json=body, token=token,
         )
         if resp is None or resp.status_code != 200:
-            return DriveItemList()
+            # Compatibility fallback: some tenants/apps do not have Microsoft
+            # Search enabled or consented. Preserve the old personal-OneDrive
+            # search behavior instead of returning a misleading empty result.
+            safe_query = query.replace("'", "''")
+            url = f"{self.msg.msg_endpoint}me/drive/root/search(q='{safe_query}')?$top={limit}"
+            fallback = await self.msg.run_async(url=url, token=token)
+            if fallback is None or fallback.status_code != 200:
+                return DriveItemList()
+            data = fallback.json()
+            items = [self._parse_drive_item(i) for i in data.get("value", [])]
+            return DriveItemList(items=items, total_items=len(items))
         items: List[DriveItem] = []
         total = 0
         for container in resp.json().get("value", []):
