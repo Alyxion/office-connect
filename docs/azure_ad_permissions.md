@@ -291,7 +291,8 @@ and Teams channel operations are typically enabled together.
 | `GET /drives/{id}/items/{id}` | `Files.Read.All` | Get metadata for a file in a specific drive |
 | `GET /me/drive/items/{id}/content` | `Files.Read.All` | Download file content from the user's OneDrive |
 | `GET /drives/{id}/items/{id}/content` | `Files.Read.All` | Download file content from a specific drive |
-| `GET /me/drive/root/search(q='...')` | `Files.Read.All` | Search for files by name or content in the user's OneDrive |
+| `POST /search/query` (`driveItem`) | `Files.Read.All`, `Sites.Read.All` | Default tenant-wide file search across OneDrive and SharePoint libraries |
+| `GET /me/drive/root/search(q='...')` | `Files.Read.All` | Fallback search for files by name or content in the user's OneDrive |
 | `GET /drives/{id}/root/search(q='...')` | `Files.Read.All` | Search for files in a specific drive |
 | `GET /me/followedSites` | `Sites.Read.All` | List SharePoint sites the user follows |
 | `GET /sites?search=...` | `Sites.Read.All` | Search for SharePoint sites by keyword |

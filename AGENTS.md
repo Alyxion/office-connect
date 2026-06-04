@@ -27,9 +27,12 @@ anything in the real account. Specifically forbidden against the live token:
   `o365_update_mail_draft`, `o365_delete_mail`, `o365_move_mail`,
   `o365_flag_mail_read`, `o365_set_mail_categories`.
 
-Allowed against the live token (GET-only): profile, list/search/get mail,
-batch get (`$batch` GETs), folder listing, unread counts, calendar reads,
-schedule/free-busy, teams/chat/files/directory reads, `o365_check_connection`.
+Allowed against the live token: read-only Microsoft Graph calls only. Most are
+GETs: profile, list/search/get mail, folder listing, unread counts, calendar
+reads, teams/chat/files/directory reads, `o365_check_connection`. Some Graph
+read APIs are POST-shaped but still allowed when they do not mutate server
+state: `$batch` containing GET subrequests only, `/search/query` for file or
+message search, and `/me/calendar/getSchedule` for schedule/free-busy.
 
 **Send/write code paths must be exercised against the mock transport only**
 (`office_con/testing/`), never the real token. If you believe a real-world write
@@ -39,7 +42,9 @@ your own judgment.
 ### Enforcement in test code
 
 - Integration tests that hit real Graph live in `tests/test_*integration*.py`
-  and must contain **GET requests only**.
+  must contain only read-only Graph calls. POST is allowed only for Graph APIs
+  that are explicitly read-only (`$batch` of GETs only, `/search/query`,
+  `/me/calendar/getSchedule`).
 - Any new real-API test must be read-only. Do not add a test that sends mail or
   creates/updates events against the resolved token file.
 - Mock-based tests (`MockGraphTransport`) are the home for all send/write
