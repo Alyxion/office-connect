@@ -12,6 +12,13 @@ from .msgraph.directory_handler import DirectoryHandler, DirectoryUser
 from .msgraph.teams_handler import TeamsHandler
 from .msgraph.chat_handler import ChatHandler
 from .msgraph.files_handler import FilesHandler
+from .privacy import (
+    OfficeContentBlockedError,
+    OfficeFileFilterRules,
+    OfficeFilterRules,
+    OfficeFolderBlock,
+    OfficePrivacyConfig,
+)
 from .msgraph.mcp_base import InProcessMCPServer, MsGraphMCPServer
 from .msgraph.office365_server import Office365MCPServer
 from .db import CompanyDir, CompanyDirBuilder
@@ -40,6 +47,11 @@ __all__ = [
     "TeamsHandler",
     "ChatHandler",
     "FilesHandler",
+    "OfficeContentBlockedError",
+    "OfficeFileFilterRules",
+    "OfficeFilterRules",
+    "OfficeFolderBlock",
+    "OfficePrivacyConfig",
     # MCP servers
     "InProcessMCPServer",
     "MsGraphMCPServer",

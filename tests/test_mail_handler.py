@@ -283,6 +283,65 @@ class TestGetMail:
         result = await mail.get_mail_async(email_id="some-id")
         assert result is None
 
+    @pytest.mark.asyncio
+    async def test_mail_search_query_returns_office_mail_list(self, graph: MsGraphInstance):
+        """The /search/query path (used for date-range mail search) returns the
+        same OfficeMailList shape as email_index_async and tolerates fractional
+        receivedDateTime formats from the search engine."""
+        mail = graph.get_mail()
+        result = await mail.mail_search_query_async(
+            "received:2025-01-01..2025-12-31", limit=10,
+        )
+        assert isinstance(result, OfficeMailList)
+        # Mock returns message resources; each should parse into an OfficeMail.
+        for m in result.elements:
+            assert isinstance(m, OfficeMail)
+            assert m.email_id
+
+    def test_format_received_tolerates_variants(self):
+        from office_con.msgraph.mail_handler import OfficeMailHandler as _H
+        # strict mailbox format
+        assert _H._format_received("2025-06-29T08:30:00Z").startswith("2025-")
+        # /search/query fractional-seconds format must not raise
+        assert _H._format_received("2025-06-29T08:30:00.0000000Z").startswith("2025-")
+        # None → falls back to "now", never raises
+        assert _H._format_received(None)
+
+    @staticmethod
+    def _attachment_msg_id(graph: MsGraphInstance) -> str:
+        for msg in graph._mock_transport._profile.mail_messages:
+            if msg.get("attachments"):
+                return msg["id"]
+        raise AssertionError("no attachment-bearing mock message found")
+
+    @pytest.mark.asyncio
+    async def test_metadata_only_attachments_skip_bytes(self, graph: MsGraphInstance):
+        """attachment_content=False lists attachments as metadata (id/name/size)
+        without downloading bytes — the path that keeps get_mail from timing out
+        on large attachments."""
+        mail = graph.get_mail()
+        msg_id = self._attachment_msg_id(graph)
+        result = await mail.get_mail_async(email_id=msg_id, attachment_content=False)
+        assert result is not None
+        assert result.has_attachments
+        assert result.attachments, "metadata listing should populate attachments"
+        for att in result.attachments:
+            assert att.attachment_id, "attachment_id needed for lazy peek/download"
+            assert att.name
+            assert att.size is not None
+            assert att.content_bytes is None, "bytes must NOT be downloaded inline"
+
+    @pytest.mark.asyncio
+    async def test_inline_content_still_downloads_bytes(self, graph: MsGraphInstance):
+        """Library default (attachment_content=True) keeps the old behaviour:
+        full bytes are expanded inline."""
+        mail = graph.get_mail()
+        msg_id = self._attachment_msg_id(graph)
+        result = await mail.get_mail_async(email_id=msg_id, attachment_content=True)
+        assert result is not None
+        assert result.attachments
+        assert any(att.content_bytes for att in result.attachments)
+
 
 # ═══════════════════════════════════════════════════════════════════
 # OfficeMailHandler — send / draft lifecycle

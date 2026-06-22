@@ -365,7 +365,16 @@ class WebUserInstance:
             except Exception:
                 pass
 
-    async def run_async(self, *, url: str, method: str = "GET", json: dict[str, object] | None = None, token: Optional[str] = None, add_headers: dict[str, str] | None = None) -> object | None:
+    async def run_async(
+        self,
+        *,
+        url: str,
+        method: str = "GET",
+        json: dict[str, object] | None = None,
+        data: bytes | None = None,
+        token: Optional[str] = None,
+        add_headers: dict[str, str] | None = None,
+    ) -> object | None:
         """Async HTTP helper using aiohttp.
 
         Returns a response object that mimics the requests library response
@@ -418,6 +427,18 @@ class WebUserInstance:
                     )
             elif method == "PATCH":
                 async with session.patch(url, headers=headers, json=json) as response:
+                    content = await response.read()
+                    text = await response.text()
+                    return AsyncResponseWrapper(
+                        response.status, content, text, response.headers, response.url
+                    )
+            elif method == "PUT":
+                request_kwargs: dict[str, object] = {"headers": headers}
+                if data is not None:
+                    request_kwargs["data"] = data
+                else:
+                    request_kwargs["json"] = json
+                async with session.put(url, **request_kwargs) as response:
                     content = await response.read()
                     text = await response.text()
                     return AsyncResponseWrapper(

@@ -11,6 +11,7 @@ from msal import ConfidentialClientApplication
 from office_con.msgraph.mail_handler import OfficeMailHandler, MailFolderHandler
 from office_con.msgraph.profile_handler import ProfileHandler, UserProfile
 from office_con.msgraph.calendar_handler import CalendarHandler
+from office_con.privacy import OfficePrivacyConfig
 from ..web_user_instance import WebUserInstance
 
 if TYPE_CHECKING:
@@ -101,6 +102,7 @@ class MsGraphInstance(WebUserInstance):
         self._calendar_handler: Optional[CalendarHandler] = None
         self.me: Optional[UserProfile] = None
         self.can_refresh = can_refresh
+        self.privacy_settings = OfficePrivacyConfig()
         # Serializes refresh attempts so concurrent tool calls don't burn
         # multiple refresh_tokens at once (Microsoft rotates them).
         self._refresh_lock = asyncio.Lock()
@@ -169,7 +171,7 @@ class MsGraphInstance(WebUserInstance):
             refreshed = await self.refresh_token_async()
             return refreshed or token
 
-    async def run_async(self, *, url, method="GET", json=None, token=None, add_headers=None):
+    async def run_async(self, *, url, method="GET", json=None, data=None, token=None, add_headers=None):
         """Send a Graph request. Retries once after a refresh if the server
         rejects the cached token with 401.
 
@@ -182,9 +184,38 @@ class MsGraphInstance(WebUserInstance):
         if token is None:
             token = await self.get_access_token_async()
 
-        response = await super().run_async(
-            url=url, method=method, json=json, token=token, add_headers=add_headers,
-        )
+        async def _send(current_token):
+            kwargs = {
+                "url": url,
+                "method": method,
+                "json": json,
+                "token": current_token,
+                "add_headers": add_headers,
+            }
+            if data is not None:
+                kwargs["data"] = data
+            # Log every physical Graph request with status + latency (URL
+            # redacted to scheme+host+path). Without this, a failed search left
+            # NO trace — non-200s are swallowed into empty results upstream and a
+            # timeout only surfaced as a generic error, so every diagnosis was a
+            # guess ("must be the known mail timeout"). Now the log states facts.
+            t0 = _time.monotonic()
+            try:
+                resp = await super(MsGraphInstance, self).run_async(**kwargs)
+            except (asyncio.TimeoutError, TimeoutError):
+                logger.warning(
+                    "[OP] %s %s -> TIMEOUT after %dms",
+                    method, _redact_url(url), int((_time.monotonic() - t0) * 1000),
+                )
+                raise
+            logger.info(
+                "[OP] %s %s -> %s (%dms)",
+                method, _redact_url(url), getattr(resp, "status_code", None),
+                int((_time.monotonic() - t0) * 1000),
+            )
+            return resp
+
+        response = await _send(token)
 
         # Absorb transient hiccups (a dropped connection during a token-refresh
         # race, or a brief Graph 5xx) with one short retry, so the first call
@@ -193,9 +224,7 @@ class MsGraphInstance(WebUserInstance):
             await asyncio.sleep(0.1)
             if token is None:
                 token = await self.get_access_token_async()
-            response = await super().run_async(
-                url=url, method=method, json=json, token=token, add_headers=add_headers,
-            )
+            response = await _send(token)
 
         # Throttling: Graph returns 429 under intensive/bursty use (notably
         # /search/query). Honor Retry-After with a few bounded retries so an
@@ -212,9 +241,7 @@ class MsGraphInstance(WebUserInstance):
                 _redact_url(url), attempt + 1, _MAX_THROTTLE_RETRIES, wait,
             )
             await asyncio.sleep(wait)
-            response = await super().run_async(
-                url=url, method=method, json=json, token=token, add_headers=add_headers,
-            )
+            response = await _send(token)
             attempt += 1
 
         if response is None or getattr(response, "status_code", 0) != 401:
@@ -238,9 +265,7 @@ class MsGraphInstance(WebUserInstance):
             )
 
         logger.info("[OP] run_async — refreshed after 401, retrying %s", _redact_url(url))
-        retry = await super().run_async(
-            url=url, method=method, json=json, token=new_token, add_headers=add_headers,
-        )
+        retry = await _send(new_token)
         if retry is not None and getattr(retry, "status_code", 0) == 401:
             raise AuthExpiredError(
                 "Microsoft Graph returned HTTP 401 even after a successful "
