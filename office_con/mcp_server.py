@@ -42,6 +42,7 @@ from office_con.mcp_permissions import (
     resolve_level,
 )
 from office_con.msgraph.ms_graph_handler import AuthExpiredError, MsGraphInstance
+from office_con.privacy import OfficeContentBlockedError, any_text_matches, decode_text_for_rules
 from office_con.logging_setup import (
     LOG_FILE_ENV,
     LOG_LEVEL_ENV,
@@ -199,7 +200,9 @@ TOOLS = [
             "List recent emails (header metadata + recipients, no full body — use "
             "o365_get_mail / o365_get_mails for bodies). Results include "
             "to_recipients/cc_recipients, conversation_id and internet_message_id so "
-            "you can filter and thread in-memory without extra fetches."
+            "you can filter and thread in-memory without extra fetches. If "
+            "access_status is content_blocked, respect access_reason and do not "
+            "try to fetch body or attachments."
         ),
         inputSchema={
             "type": "object",
@@ -216,10 +219,15 @@ TOOLS = [
         name="o365_get_mail",
         description=(
             "Get a single email by ID, including body and attachments metadata. "
+            "Attachments are listed as metadata only (attachment_id, name, content_type, "
+            "size) — the bytes are NOT downloaded here (that previously timed out on "
+            "large PDFs); read an attachment lazily with o365_peek_mail_attachment using "
+            "its attachment_id. "
             "Use body_format='text' to avoid bloated HTML; bodies over max_body_chars "
             "are truncated with body_truncated=true (raise max_body_chars or pass "
             "body_format='text' to get the rest). Meeting-request mails include event_id "
-            "for o365_get_events."
+            "for o365_get_events. If access_status is content_blocked, respect "
+            "access_reason."
         ),
         inputSchema={
             "type": "object",
@@ -236,7 +244,8 @@ TOOLS = [
         description=(
             "Batch-fetch multiple emails by ID in ONE round trip (Graph $batch). Use "
             "this to pull a whole thread/conversation at once instead of N get_mail "
-            "calls. Returns messages in the order requested; missing ids are skipped."
+            "calls. Returns messages in the order requested; missing ids are skipped. "
+            "If access_status is content_blocked, respect access_reason."
         ),
         inputSchema={
             "type": "object",
@@ -261,7 +270,8 @@ TOOLS = [
             "(sender name, subject keyword, date range, etc.). All structured params "
             "are AND-ed. Dates are inclusive. Returns header metadata + recipients "
             "(no body) so you can filter in-memory. Searches all folders unless 'folder' "
-            "is given; 'exclude_folders' drops e.g. Deleted/Junk."
+            "is given; 'exclude_folders' drops e.g. Deleted/Junk. If access_status "
+            "is content_blocked, respect access_reason and do not fetch the body."
         ),
         inputSchema={
             "type": "object",
@@ -850,7 +860,9 @@ TOOLS = [
             "SharePoint document library they can access (tenant-wide, via Microsoft "
             "Search) — the same corpus as the OneDrive/SharePoint web UI. Each hit "
             "carries a 'drive_id'; pass it (with the item 'id') to o365_peek_drive_file "
-            "or o365_get_file_content to open results that live in SharePoint sites."
+            "or o365_get_file_content to open results that live in SharePoint sites. "
+            "If access_status is content_blocked or folder_blocked, respect "
+            "access_reason and do not inspect content."
         ),
         inputSchema={
             "type": "object",
@@ -1607,8 +1619,12 @@ async def _handle_tool(
     if name == "o365_get_mail":
         mail = graph.get_mail()
         fmt, max_chars = _body_opts(args)
+        # Metadata-only attachment listing (attachment_content=False): never pull
+        # multi-MB attachment bytes inline — that is what timed get_mail out. The
+        # agent reads attachments lazily via o365_peek_mail_attachment by id.
         result = await mail.get_mail_async(
-            email_id=args["email_id"], body_format=fmt, max_body_chars=max_chars,
+            email_id=args["email_id"], attachment_content=False,
+            body_format=fmt, max_body_chars=max_chars,
         )
         return _json_result(result)
 
@@ -1645,11 +1661,26 @@ async def _handle_tool(
                      "from/to/subject/body/since/until/has_attachments/query.",
             )]
         mail = graph.get_mail()
-        result = await mail.email_index_async(
-            query=kql, limit=args.get("limit", 25),
-            folder=args.get("folder"),
-            exclude_folders=args.get("exclude_folders"),
-        )
+        # A date bound (since/until) needs KQL range support that the mailbox
+        # $search query param does NOT reliably provide — route those through the
+        # Substrate /search/query API (entityTypes message), which handles
+        # received:start..end + free text natively. Plain text searches stay on
+        # the lighter, less throttle-prone mailbox $search. Both return
+        # OfficeMailList, so the tool output is identical either way. Note:
+        # /search/query ignores folder scoping, so fall back to $search when a
+        # folder/exclusion is requested.
+        has_date = bool(args.get("since") or args.get("until"))
+        folder_scoped = bool(args.get("folder") or args.get("exclude_folders"))
+        if has_date and not folder_scoped:
+            result = await mail.mail_search_query_async(
+                kql, limit=args.get("limit", 25),
+            )
+        else:
+            result = await mail.email_index_async(
+                query=kql, limit=args.get("limit", 25),
+                folder=args.get("folder"),
+                exclude_folders=args.get("exclude_folders"),
+            )
         return _json_result(result)
 
     # ── Mail: drafts (DRAFTS tier) ────────────────────────────────────
@@ -2079,7 +2110,10 @@ async def _handle_tool(
     if name == "o365_get_file_content":
         files = graph.get_files()
         drive_id = args.get("drive_id", "") or None
-        content = await files.get_file_content_async(args["item_id"], drive_id=drive_id)
+        try:
+            content = await files.get_file_content_async(args["item_id"], drive_id=drive_id)
+        except OfficeContentBlockedError as exc:
+            return [TextContent(type="text", text=f"Access blocked by privacy settings: {exc.reason}")]
         if content is None:
             return [TextContent(type="text", text="File not found or is a folder.")]
         try:
@@ -2093,7 +2127,10 @@ async def _handle_tool(
         files = graph.get_files()
         drive_id = args.get("drive_id", "") or None
         item_meta = await _fetch_drive_item_meta(graph, args["item_id"], drive_id)
-        content = await files.get_file_content_async(args["item_id"], drive_id=drive_id)
+        try:
+            content = await files.get_file_content_async(args["item_id"], drive_id=drive_id)
+        except OfficeContentBlockedError as exc:
+            return [TextContent(type="text", text=f"Access blocked by privacy settings: {exc.reason}")]
         if content is None:
             return [TextContent(type="text", text="File not found or is a folder.")]
         name_hint = (item_meta or {}).get("name")
@@ -2104,6 +2141,14 @@ async def _handle_tool(
         )
 
     if name == "o365_peek_mail_attachment":
+        # Existence + privacy gate only; the attachment bytes are fetched by id
+        # below, so don't expand any attachments here (avoids the inline-download
+        # timeout that get_mail itself had).
+        mail = await graph.get_mail().get_mail_async(email_id=args["email_id"], attachments=False, body_format="none")
+        if mail is None:
+            return [TextContent(type="text", text="Email not found.")]
+        if mail.access_status == "content_blocked":
+            return [TextContent(type="text", text=f"Access blocked by privacy settings: {mail.access_reason}")]
         token = await graph.get_access_token_async()
         url = (
             f"{graph.msg_endpoint}me/messages/{args['email_id']}"
@@ -2121,7 +2166,19 @@ async def _handle_tool(
                 text=f"Attachment has no inline content (type={att.get('@odata.type')}). "
                      f"May be an item attachment or reference attachment.",
             )]
+        cfg = graph.privacy_settings.mail
+        if cfg.enabled:
+            if any_text_matches([att.get("name")], cfg.hidden_name_terms):
+                return [TextContent(type="text", text="Attachment not found.")]
+            if any_text_matches([att.get("name")], cfg.blocked_content_name_terms):
+                return [TextContent(type="text", text="Access blocked by privacy settings: Attachment content access is blocked.")]
         content = base64.b64decode(cb)
+        if cfg.enabled:
+            text = decode_text_for_rules(content)
+            if text and any_text_matches([text], cfg.hidden_content_terms):
+                return [TextContent(type="text", text="Attachment not found.")]
+            if text and any_text_matches([text], cfg.blocked_content_terms):
+                return [TextContent(type="text", text="Access blocked by privacy settings: Attachment content access is blocked.")]
         return _peek_result(
             content, args,
             name=att.get("name"),

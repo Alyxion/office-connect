@@ -7,6 +7,8 @@ from typing import List, Optional, Dict
 
 from pydantic import BaseModel, Field
 
+from office_con.privacy import any_text_matches
+
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
@@ -17,9 +19,11 @@ _log = logging.getLogger(__name__)
 
 class OfficeMailAttachment(BaseModel):
     """A file or inline image attached to an Outlook email."""
+    attachment_id: Optional[str] = Field(default=None, description="MS Graph attachment id — pass to o365_peek_mail_attachment to read it lazily")
     name: str = Field(description="Attachment filename")
     content_type: str = Field(description="MIME type, e.g. application/pdf")
-    content_bytes: bytes | None = Field(default=None, description="Raw attachment bytes")
+    size: Optional[int] = Field(default=None, description="Attachment size in bytes (from metadata; present even when content_bytes is not downloaded)")
+    content_bytes: bytes | None = Field(default=None, description="Raw attachment bytes (only when fetched with attachment_content=True)")
     content_id: Optional[str] = Field(default=None, description="Content-ID for embedded images (cid: references)")
     is_embedded: bool = Field(default=False, description="Whether the attachment is embedded inline in the email body")
 
@@ -76,6 +80,8 @@ class OfficeMail(BaseModel):
     confidential_level: Optional[str] = Field(default=None, description="Sensitivity: normal, personal, private, confidential")
     attachments: List[OfficeMailAttachment] = Field(default_factory=list, description="File and inline attachments")
     zip_data: Optional[bytes] = Field(default=None, description="Compressed attachment bundle for transport")
+    access_status: str = Field(default="ok", description="ok or content_blocked")
+    access_reason: str = Field(default="", description="Human-readable privacy/access reason")
 
     @property
     def scanning(self) -> bool:
@@ -337,15 +343,33 @@ class OfficeMailHandler:
 
     # ── parsing helpers (no I/O) ──────────────────────────────────────────
 
+    @staticmethod
+    def _format_received(time_stamp: str | None) -> str:
+        """Parse Graph's receivedDateTime to a local 'YYYY-MM-DD HH:MM:SS' string.
+
+        Tolerant of format variants: the mailbox endpoints return the strict
+        ``%Y-%m-%dT%H:%M:%SZ``, but ``/search/query`` can return fractional
+        seconds (``...00.0000000Z``) or an offset. A strict strptime here would
+        raise and take down the whole search, so fall back progressively."""
+        if not time_stamp:
+            return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S.%fZ"):
+            try:
+                utc = datetime.strptime(time_stamp, fmt).replace(tzinfo=timezone.utc)
+                return utc.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                continue
+        try:
+            utc = datetime.fromisoformat(time_stamp.replace("Z", "+00:00"))
+            if utc.tzinfo is None:
+                utc = utc.replace(tzinfo=timezone.utc)
+            return utc.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
     def parse_mail(self, email: dict[str, object]) -> OfficeMail:
         mail_address = email.get('from', {}).get('emailAddress', {})
-        time_stamp = email.get('receivedDateTime', None)
-        if time_stamp:
-            utc_time = datetime.strptime(time_stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-            local_time = utc_time.astimezone()
-            local_time_str = local_time.strftime("%Y-%m-%d %H:%M:%S")
-        else:
-            local_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        local_time_str = self._format_received(email.get('receivedDateTime', None))
 
         attachments = []
         for attachment in email.get('attachments', []):
@@ -357,8 +381,10 @@ class OfficeMailHandler:
             content_id = attachment.get('contentId', None)
             content_bytes = base64.b64decode(attachment_content)
             new_attachment = OfficeMailAttachment(
+                attachment_id=attachment.get('id'),
                 name=attachment_name,
                 content_type=attachment_type,
+                size=attachment.get('size'),
                 content_bytes=content_bytes,
                 content_id=content_id
             )
@@ -436,6 +462,66 @@ class OfficeMailHandler:
             event_id=event.get('id'),
         )
         return new_mail
+
+    def _privacy_enabled(self) -> bool:
+        return self.msg.privacy_settings.mail.enabled
+
+    def _mail_name_values(self, mail: OfficeMail) -> list[str | None]:
+        values: list[str | None] = [mail.subject, mail.from_name, mail.from_email, mail.sender_name, mail.sender_email]
+        values.extend(attachment.name for attachment in mail.attachments)
+        return values
+
+    def _mail_content_values(self, mail: OfficeMail) -> list[str | None]:
+        return [mail.body_preview, mail.body, mail.body_text]
+
+    def _whitelisted(self, mail: OfficeMail) -> bool:
+        """True when an allowed term matches any name or content value — the
+        keyword hide/block rules are then skipped for this mail."""
+        cfg = self.msg.privacy_settings.mail
+        if not cfg.allowed_terms:
+            return False
+        values = self._mail_name_values(mail) + self._mail_content_values(mail)
+        return any_text_matches(values, cfg.allowed_terms)
+
+    def _hidden_by_privacy(self, mail: OfficeMail) -> bool:
+        if not self._privacy_enabled():
+            return False
+        if self._whitelisted(mail):
+            return False
+        cfg = self.msg.privacy_settings.mail
+        if any_text_matches(self._mail_name_values(mail), cfg.hidden_name_terms):
+            return True
+        if any_text_matches(self._mail_content_values(mail), cfg.hidden_content_terms):
+            return True
+        return False
+
+    def _apply_mail_privacy(self, mail: OfficeMail) -> OfficeMail | None:
+        if self._hidden_by_privacy(mail):
+            return None
+        if not self._privacy_enabled():
+            return mail
+        if self._whitelisted(mail):
+            return mail
+        cfg = self.msg.privacy_settings.mail
+        if (
+            any_text_matches(self._mail_name_values(mail), cfg.blocked_content_name_terms)
+            or any_text_matches(self._mail_content_values(mail), cfg.blocked_content_terms)
+        ):
+            mail.access_status = "content_blocked"
+            mail.access_reason = "Email content access is blocked by your privacy settings."
+            mail.body = None
+            mail.body_text = None
+            mail.body_preview = None
+            mail.attachments = []
+        return mail
+
+    def _filter_mail_list(self, mails: list[OfficeMail]) -> list[OfficeMail]:
+        filtered: list[OfficeMail] = []
+        for mail in mails:
+            visible = self._apply_mail_privacy(mail)
+            if visible is not None:
+                filtered.append(visible)
+        return filtered
 
     async def _resolve_smtp_by_name_async(self, name: str | None) -> str | None:
         """Best-effort directory lookup mapping a display name to its SMTP
@@ -640,6 +726,14 @@ class OfficeMailHandler:
 
         response = await self.msg.run_async(url=url, token=access_token)
         if response is None or response.status_code != 200:
+            # Don't let a real failure masquerade as an empty mailbox. A 400 here
+            # is typically an unsupported $search query (e.g. a KQL date range);
+            # 403 a missing scope. Log it so it's distinguishable from "0 results".
+            status = getattr(response, "status_code", None)
+            _log.warning(
+                "email_index_async — non-200 from Graph (status=%s, search=%s); "
+                "returning empty list", status, query is not None,
+            )
             return OfficeMailList()
         json_object = response.json()
         emails = json_object.get('value', [])
@@ -652,16 +746,84 @@ class OfficeMailHandler:
             new_mail = self.parse_mail(email)
             new_mail.email_url = f"{end_point}/{base}/messages/{new_mail.email_id}"
             new_mail.graph_url = new_mail.email_url
-            email_list.append(new_mail)
+            visible_mail = self._apply_mail_privacy(new_mail)
+            if visible_mail is None:
+                continue
+            email_list.append(visible_mail)
             if len(email_list) >= limit:
                 break
 
         await self.resolve_legacy_addresses_async(email_list)
         return OfficeMailList(elements=email_list, total_mails=total_count)
 
+    # Fields requested from /search/query (Graph property names, mirroring
+    # _INDEX_FIELDS). Header metadata only — no body — to keep payloads small.
+    _SEARCH_FIELDS = [
+        "id", "from", "sender", "toRecipients", "ccRecipients", "subject",
+        "bodyPreview", "receivedDateTime", "isRead", "hasAttachments",
+        "categories", "importance", "conversationId", "internetMessageId",
+        "webLink", "parentFolderId",
+    ]
+
+    async def mail_search_query_async(
+        self, kql: str, *, limit: int = 25,
+    ) -> OfficeMailList:
+        """Search mail via the Substrate ``/search/query`` API (entity type
+        ``message``). Unlike the mailbox ``$search`` query parameter, this engine
+        natively supports KQL date ranges (``received:2025-01-01..2025-12-31``)
+        and property restrictions (``from:``/``to:``/``subject:``) combined with
+        free text — which is why it is used when the caller supplies a date
+        bound. Returns the same OfficeMailList shape as ``email_index_async`` so
+        the two paths are interchangeable. Returns an empty list on non-200."""
+        access_token = await self.msg.get_access_token_async()
+        if not access_token:
+            return OfficeMailList()
+        body = {
+            "requests": [{
+                "entityTypes": ["message"],
+                "query": {"queryString": kql},
+                "from": 0,
+                "size": max(1, min(limit, 250)),
+                "fields": self._SEARCH_FIELDS,
+            }]
+        }
+        resp = await self.msg.run_async(
+            url=f"{self.msg.msg_endpoint}search/query",
+            method="POST", json=body, token=access_token,
+        )
+        if resp is None or getattr(resp, "status_code", 0) != 200:
+            status = getattr(resp, "status_code", None)
+            _log.warning(
+                "mail_search_query_async — non-200 from /search/query "
+                "(status=%s); returning empty list", status,
+            )
+            return OfficeMailList()
+        end_point = (self.msg.msg_endpoint or "").rstrip('/')
+        email_list: list[OfficeMail] = []
+        total = 0
+        for container in resp.json().get("value", []):
+            for hc in container.get("hitsContainers", []):
+                total = hc.get("total", total)
+                for hit in hc.get("hits", []):
+                    resource = hit.get("resource") or {}
+                    if not resource.get("id"):
+                        continue
+                    new_mail = self.parse_mail(resource)
+                    new_mail.email_url = f"{end_point}/me/messages/{new_mail.email_id}"
+                    new_mail.graph_url = new_mail.email_url
+                    visible = self._apply_mail_privacy(new_mail)
+                    if visible is None:
+                        continue
+                    email_list.append(visible)
+                    if len(email_list) >= limit:
+                        break
+        await self.resolve_legacy_addresses_async(email_list)
+        return OfficeMailList(elements=email_list, total_mails=total or len(email_list))
+
     async def get_mail_async(
         self, email_id: Optional[str] = None, email_url: Optional[str] = None,
         attachments=True, *,
+        attachment_content: bool = True,
         body_format: str = "html",
         max_body_chars: int | None = None,
     ) -> OfficeMail | None:
@@ -670,13 +832,22 @@ class OfficeMailHandler:
         *body_format*: 'html' (default), 'text' (request Graph's plain-text
         body via Prefer), or 'none' (skip the body, keeping bodyPreview only).
         *max_body_chars*: truncate the body, setting body_truncated=True.
+        *attachments*: include the attachment list at all.
+        *attachment_content*: when True (default, back-compat), download the full
+        attachment bytes inline via ``$expand=attachments`` and populate
+        ``content_bytes``. When False, fetch only lightweight metadata (id, name,
+        type, size) in a separate, constant-size request — this avoids the 60s
+        request timeout on messages carrying multi-MB attachments. Pull the bytes
+        lazily afterwards (e.g. via o365_peek_mail_attachment) using the ids.
         """
         access_token = await self.msg.get_access_token_async()
         if not access_token:
             return None
         include_body = body_format != "none"
+        # Heavy inline expansion only when the caller actually wants the bytes.
+        expand_inline = attachments and attachment_content
         url = self._build_mail_url(
-            email_id, email_url, attachments, include_body=include_body,
+            email_id, email_url, expand_inline, include_body=include_body,
         )
         add_headers = None
         if body_format == "text":
@@ -691,6 +862,12 @@ class OfficeMailHandler:
         if mail.email_id:
             mail.graph_url = f"{end_point}/me/messages/{mail.email_id}"
             mail.email_url = mail.graph_url
+        # Metadata-only attachment listing: the message fetch above did NOT expand
+        # bytes, so grab ids/names/sizes in a cheap follow-up call for lazy access.
+        if attachments and not attachment_content and mail.has_attachments and mail.email_id:
+            mail.attachments = await self._fetch_attachment_meta_async(
+                mail.email_id, access_token,
+            )
         # Meeting-request messages link a calendar event; fetch its id so the
         # caller can hand it to o365_get_events. Bounded to eventMessage types.
         if not mail.event_id and "eventmessage" in (mail.email_type or "").lower() and mail.email_id:
@@ -699,6 +876,10 @@ class OfficeMailHandler:
         if mail.body_text is None and mail.body_type == "html":
             mail.body_text = _html_to_text(mail.body)
         _apply_body_limit(mail, max_body_chars)
+        visible_mail = self._apply_mail_privacy(mail)
+        if visible_mail is None:
+            return None
+        mail = visible_mail
         await self.resolve_legacy_addresses_async([mail])
         return mail
 
@@ -734,6 +915,43 @@ class OfficeMailHandler:
             url=url, method="POST", json=payload, token=access_token,
         )
         return resp is not None and getattr(resp, "status_code", 0) in (200, 202)
+
+    async def _fetch_attachment_meta_async(
+        self, email_id: str, token: str,
+    ) -> List[OfficeMailAttachment]:
+        """List attachment metadata (id, name, type, size) WITHOUT downloading
+        the bytes. ``$select`` omits ``contentBytes`` so the response stays small
+        and constant-size regardless of attachment size — this is what keeps
+        get_mail from timing out on messages with multi-MB attachments. Bytes are
+        pulled lazily later via o365_peek_mail_attachment using ``attachment_id``.
+
+        Only base ``microsoft.graph.attachment`` properties are selected:
+        ``contentId``/``contentBytes`` live on the derived ``fileAttachment`` type,
+        and selecting them on the polymorphic collection makes Graph reject the
+        whole request with HTTP 400 (silently emptying the list)."""
+        url = (
+            f"{self.msg.msg_endpoint}me/messages/{email_id}/attachments"
+            "?$select=id,name,contentType,size,isInline"
+        )
+        resp = await self.msg.run_async(url=url, token=token)
+        status = getattr(resp, "status_code", None)
+        if resp is None or status != 200:
+            _log.warning(
+                "attachment metadata fetch failed (status=%s); returning empty list",
+                status,
+            )
+            return []
+        out: List[OfficeMailAttachment] = []
+        for a in resp.json().get("value", []):
+            out.append(OfficeMailAttachment(
+                attachment_id=a.get("id"),
+                name=a.get("name") or "",
+                content_type=a.get("contentType") or "",
+                size=a.get("size"),
+                content_id=a.get("contentId"),
+                is_embedded=bool(a.get("isInline", False)),
+            ))
+        return out
 
     async def _fetch_event_id_async(self, email_id: str, token: str) -> str | None:
         """Best-effort: resolve the linked calendar event id for a meeting
@@ -798,7 +1016,9 @@ class OfficeMailHandler:
                 if mail.body_text is None and mail.body_type == "html":
                     mail.body_text = _html_to_text(mail.body)
                 _apply_body_limit(mail, max_body_chars)
-                by_id[mail.email_id] = mail
+                visible_mail = self._apply_mail_privacy(mail)
+                if visible_mail is not None:
+                    by_id[mail.email_id] = visible_mail
 
         ordered = [by_id[mid] for mid in email_ids if mid in by_id]
         await self.resolve_legacy_addresses_async(ordered)

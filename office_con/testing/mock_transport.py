@@ -130,6 +130,10 @@ class MockGraphTransport:
         if path.startswith("me/messages"):
             return self._messages_response(path, method, json_body, qs)
 
+        # ── /search/query (Substrate search) ─────────────────
+        if path == "search/query" and method == "POST":
+            return self._search_query_response(json_body)
+
         # ── /me/sendMail ─────────────────────────────────────
         if path == "me/sendMail":
             return _make_response(202, {})
@@ -437,12 +441,72 @@ class MockGraphTransport:
             return _make_response(200, {"value": matched[:top]})
         # GET single message by ID — extract ID from path like me/messages/{id}
         parts = path.rstrip("/").split("/")
+        # GET me/messages/{id}/attachments — metadata listing (no contentBytes
+        # when $select omits it, mirroring the real Graph projection).
+        if parts[-1] == "attachments" and len(parts) >= 3:
+            att_msg_id = parts[-2]
+            select = (qs.get("$select", [""])[0] or "")
+            # Mirror Graph: contentId/contentBytes/contentLocation live on the
+            # derived fileAttachment type, not the base attachment type, so
+            # selecting them on the polymorphic collection is a 400.
+            selected = {s.strip() for s in select.split(",") if s.strip()}
+            derived_only = {"contentId", "contentBytes", "contentLocation"}
+            if selected & derived_only:
+                return _make_response(400, {"error": {
+                    "code": "RequestBroker--ParseUri",
+                    "message": "Could not find a property named "
+                               f"'{(selected & derived_only).pop()}' on type "
+                               "'microsoft.graph.attachment'.",
+                }})
+            want_bytes = "contentBytes" in select
+            for msg in self._profile.mail_messages:
+                if msg.get("id") == att_msg_id:
+                    value = []
+                    for i, att in enumerate(msg.get("attachments", [])):
+                        item = dict(att)
+                        item.setdefault("id", f"{att_msg_id}-att{i}")
+                        if not want_bytes:
+                            item.pop("contentBytes", None)
+                        value.append(item)
+                    return _make_response(200, {"value": value})
+            return _make_response(200, {"value": []})
         msg_id = parts[-1] if len(parts) >= 2 else ""
         for msg in self._profile.mail_messages:
             if msg.get("id") == msg_id:
                 return _make_response(200, msg)
         # Fallback: return first message
         return _make_response(200, self._profile.mail_messages[0] if self._profile.mail_messages else {})
+
+    # ── /search/query ────────────────────────────────────────
+
+    def _search_query_response(self, json_body: dict | None) -> _MockResponse:
+        """Synthesize a Substrate /search/query response. Supports the 'message'
+        entity type (used by mail date-range search); for messages, a loose
+        substring match on the free-text part of the KQL against subject/preview.
+        Returns the message resources wrapped in hitsContainers."""
+        requests = (json_body or {}).get("requests", [])
+        req = requests[0] if requests else {}
+        entity_types = req.get("entityTypes", [])
+        kql = (req.get("query", {}) or {}).get("queryString", "") or ""
+        size = req.get("size", 25)
+        if "message" in entity_types:
+            # Strip KQL property restrictions (foo:bar) to get free-text terms.
+            terms = [t for t in kql.split() if ":" not in t and ".." not in t]
+            needle = " ".join(terms).strip().lower()
+            matched = []
+            for m in self._profile.mail_messages:
+                hay = ((m.get("subject", "") or "") + " "
+                       + (m.get("bodyPreview", "") or "")).lower()
+                if not needle or needle in hay:
+                    matched.append(m)
+            hits = [{"resource": m} for m in matched[:size]]
+            return _make_response(200, {"value": [{
+                "hitsContainers": [{"hits": hits, "total": len(matched)}],
+            }]})
+        # Other entity types (chatMessage, etc.): empty but well-formed.
+        return _make_response(200, {"value": [{
+            "hitsContainers": [{"hits": [], "total": 0}],
+        }]})
 
     # ── Teams ────────────────────────────────────────────────
 

@@ -1,18 +1,30 @@
 """Microsoft Graph Files & SharePoint handler (async-only).
 
-Provides read access to:
+Provides file access to:
 - OneDrive drives (personal and shared)
 - Drive items (files and folders)
 - SharePoint sites
 - File content download
+- Explicit file/folder writes for whitelisted callers; no delete helper
 """
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import List, Optional, TYPE_CHECKING
+from urllib.parse import quote
 
 from pydantic import BaseModel, Field
+
+from office_con.privacy import (
+    OfficeContentBlockedError,
+    any_text_matches,
+    decode_text_for_rules,
+    folder_path_for_match,
+)
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from office_con import MsGraphInstance
@@ -38,6 +50,8 @@ class DriveItem(BaseModel):
     name: Optional[str] = Field(default=None, description="File or folder name")
     size: Optional[int] = Field(default=None, description="Size in bytes")
     web_url: Optional[str] = Field(default=None, description="Browser URL")
+    e_tag: Optional[str] = Field(default=None, description="Graph eTag; changes when the item resource changes")
+    c_tag: Optional[str] = Field(default=None, description="Graph cTag; changes when file content changes")
     created_at: Optional[datetime] = Field(default=None, description="Creation timestamp (UTC)")
     modified_at: Optional[datetime] = Field(default=None, description="Last modified timestamp (UTC)")
     created_by: Optional[DriveItemUser] = Field(default=None, description="Who created the item")
@@ -48,12 +62,45 @@ class DriveItem(BaseModel):
     download_url: Optional[str] = Field(default=None, description="Pre-authenticated download URL (short-lived)")
     drive_id: Optional[str] = Field(default=None, description="ID of the drive that holds this item (needed to fetch/download items found via tenant-wide search, since they may live in SharePoint libraries rather than the user's OneDrive)")
     parent_path: Optional[str] = Field(default=None, description="Path of the parent folder (from parentReference)")
+    parent_id: Optional[str] = Field(default=None, description="ID of the parent folder (from parentReference)")
+    access_status: str = Field(default="ok", description="ok, content_blocked, or folder_blocked")
+    access_reason: str = Field(default="", description="Human-readable privacy/access reason")
+
+    @property
+    def change_signature(self) -> str:
+        """Cheap provider-side token for detecting item/content changes."""
+        tokens = [self.c_tag or "", self.e_tag or ""]
+        token_signature = "|".join(token for token in tokens if token)
+        if token_signature:
+            return token_signature
+        modified = self.modified_at.isoformat() if self.modified_at is not None else ""
+        size = self.size if self.size is not None else 0
+        return f"{modified}|{size}"
 
 
 class DriveItemList(BaseModel):
     """List of drive items."""
     items: List[DriveItem] = Field(default_factory=list, description="Files and folders")
     total_items: int = Field(default=0, description="Total number of items")
+
+
+class DriveItemVersion(BaseModel):
+    """A metadata-only file version entry."""
+    id: str = Field(..., description="Version ID")
+    modified_at: Optional[datetime] = Field(default=None, description="Version modified timestamp (UTC)")
+    size: Optional[int] = Field(default=None, description="Version size in bytes")
+
+    @property
+    def change_signature(self) -> str:
+        modified = self.modified_at.isoformat() if self.modified_at is not None else ""
+        size = self.size if self.size is not None else 0
+        return f"{self.id}|{modified}|{size}"
+
+
+class DriveItemVersionList(BaseModel):
+    """List of file versions."""
+    versions: List[DriveItemVersion] = Field(default_factory=list, description="File versions")
+    total_versions: int = Field(default=0, description="Total number of returned versions")
 
 
 class Drive(BaseModel):
@@ -93,7 +140,7 @@ class SharePointSiteList(BaseModel):
 
 
 class FilesHandler:
-    """Handler for Microsoft Graph Files & SharePoint API (read-only, async-only).
+    """Handler for Microsoft Graph Files & SharePoint API (async-only).
 
     Covers OneDrive files, SharePoint document libraries, and site discovery.
     Requires Files.Read.All (or Files.ReadWrite.All) and Sites.Read.All scopes.
@@ -150,6 +197,8 @@ class FilesHandler:
             name=data.get("name"),
             size=data.get("size"),
             web_url=data.get("webUrl"),
+            e_tag=data.get("eTag"),
+            c_tag=data.get("cTag"),
             created_at=FilesHandler._parse_datetime(data.get("createdDateTime")),
             modified_at=FilesHandler._parse_datetime(data.get("lastModifiedDateTime")),
             created_by=FilesHandler._parse_user_ref(data.get("createdBy")),
@@ -160,7 +209,117 @@ class FilesHandler:
             download_url=data.get("@microsoft.graph.downloadUrl"),
             drive_id=parent.get("driveId"),
             parent_path=parent.get("path"),
+            parent_id=parent.get("id"),
         )
+
+    def _privacy_enabled(self) -> bool:
+        return self.msg.privacy_settings.files.enabled
+
+    def _folder_block_reason(self, item: DriveItem) -> str:
+        if not self._privacy_enabled():
+            return ""
+        item_drive = item.drive_id or ""
+        item_path = folder_path_for_match(item.parent_path, item.name)
+        for blocked in self.msg.privacy_settings.files.blocked_folders:
+            blocked_drive = blocked.drive_id or ""
+            if blocked_drive and item_drive and blocked_drive != item_drive:
+                continue
+            if item.is_folder and blocked.item_id and item.id == blocked.item_id:
+                return "Folder is blocked by your privacy settings."
+            if blocked.item_id and item.parent_id == blocked.item_id:
+                return "Parent folder is blocked by your privacy settings."
+            blocked_path = folder_path_for_match(blocked.parent_path, blocked.name)
+            if blocked_path and item_path and item_path.startswith(blocked_path.rstrip("/") + "/"):
+                return "Parent folder is blocked by your privacy settings."
+        return ""
+
+    def _whitelisted_by_name(self, item: DriveItem) -> bool:
+        """True when an allowed term matches the item's name/url/path — the
+        keyword hide/block rules are then skipped. Explicit folder/item blocks
+        are not affected."""
+        cfg = self.msg.privacy_settings.files
+        if not cfg.allowed_terms:
+            return False
+        return any_text_matches([item.name, item.web_url, item.parent_path], cfg.allowed_terms)
+
+    def _hidden_by_metadata(self, item: DriveItem) -> bool:
+        if not self._privacy_enabled():
+            return False
+        if self._whitelisted_by_name(item):
+            return False
+        cfg = self.msg.privacy_settings.files
+        if any_text_matches([item.name, item.web_url, item.parent_path], cfg.hidden_name_terms):
+            return True
+        return False
+
+    def _item_is_blocked(self, item: DriveItem) -> bool:
+        if not item.id:
+            return False
+        item_drive = item.drive_id or ""
+        for blocked in self.msg.privacy_settings.files.blocked_items:
+            if blocked.item_id != item.id:
+                continue
+            blocked_drive = blocked.drive_id or ""
+            if blocked_drive and item_drive and blocked_drive != item_drive:
+                continue
+            return True
+        return False
+
+    def _apply_metadata_privacy(self, item: DriveItem, *, enforce_folders: bool = True) -> DriveItem | None:
+        if self._hidden_by_metadata(item):
+            return None
+        if enforce_folders:
+            folder_reason = self._folder_block_reason(item)
+            if folder_reason:
+                item.access_status = "folder_blocked"
+                item.access_reason = folder_reason
+                return item
+        if not self._privacy_enabled():
+            return item
+        cfg = self.msg.privacy_settings.files
+        if self._item_is_blocked(item):
+            item.access_status = "content_blocked"
+            item.access_reason = "This file is blocked by your privacy settings."
+            return item
+        if self._whitelisted_by_name(item):
+            return item
+        if any_text_matches([item.name, item.web_url, item.parent_path], cfg.blocked_content_name_terms):
+            item.access_status = "content_blocked"
+            item.access_reason = "Content access is blocked by your privacy settings."
+        return item
+
+    def _filter_items(self, items: list[DriveItem], *, enforce_folders: bool = True) -> list[DriveItem]:
+        filtered: list[DriveItem] = []
+        for item in items:
+            visible = self._apply_metadata_privacy(item, enforce_folders=enforce_folders)
+            if visible is not None:
+                filtered.append(visible)
+        return filtered
+
+    def _content_block_reason(
+        self, item: DriveItem, content: bytes | None = None, *, enforce_folders: bool = True
+    ) -> str:
+        metadata_item = self._apply_metadata_privacy(item, enforce_folders=enforce_folders)
+        if metadata_item is None:
+            return "hidden"
+        if metadata_item.access_status == "folder_blocked":
+            return metadata_item.access_reason or "Folder is blocked by your privacy settings."
+        if metadata_item.access_status == "content_blocked":
+            return metadata_item.access_reason or "Content access is blocked by your privacy settings."
+        if not self._privacy_enabled():
+            return ""
+        cfg = self.msg.privacy_settings.files
+        if content is not None:
+            text = decode_text_for_rules(content)
+            whitelisted = self._whitelisted_by_name(item) or bool(
+                text and any_text_matches([text], cfg.allowed_terms)
+            )
+            if not whitelisted:
+                if text and any_text_matches([text], cfg.hidden_content_terms):
+                    return "hidden"
+                if text and any_text_matches([text], cfg.blocked_content_terms):
+                    return "Content access is blocked by your privacy settings."
+        return ""
 
     @staticmethod
     def _parse_site(data: dict) -> SharePointSite:
@@ -171,6 +330,14 @@ class FilesHandler:
             web_url=data.get("webUrl"),
             description=data.get("description"),
             created_at=FilesHandler._parse_datetime(data.get("createdDateTime")),
+        )
+
+    @staticmethod
+    def _parse_drive_item_version(data: dict) -> DriveItemVersion:
+        return DriveItemVersion(
+            id=str(data.get("id") or ""),
+            modified_at=FilesHandler._parse_datetime(data.get("lastModifiedDateTime")),
+            size=data.get("size"),
         )
 
     # ── async API — Drives ────────────────────────────────────────────────
@@ -217,15 +384,21 @@ class FilesHandler:
         if resp is None or resp.status_code != 200:
             return DriveItemList()
         data = resp.json()
-        items = [self._parse_drive_item(i) for i in data.get("value", [])]
+        items = self._filter_items([self._parse_drive_item(i) for i in data.get("value", [])])
         return DriveItemList(items=items, total_items=len(items))
 
     async def get_folder_items_async(
-        self, item_id: str, drive_id: str | None = None, limit: int = 50
+        self, item_id: str, drive_id: str | None = None, limit: int = 50,
+        *, enforce_folder_block: bool = True,
     ) -> DriveItemList:
         """List children of a folder.
 
         If ``drive_id`` is None, uses the current user's default OneDrive.
+
+        ``enforce_folder_block`` is True by default (used by the AI/MCP path);
+        a host UI may pass False to let the owner browse *into* a blocked folder
+        (the children are not folder-blocked, but hide and content/name rules
+        still apply). This is an explicit human-authorized override only.
         """
         token = await self.msg.get_access_token_async()
         if not token:
@@ -238,7 +411,10 @@ class FilesHandler:
         if resp is None or resp.status_code != 200:
             return DriveItemList()
         data = resp.json()
-        items = [self._parse_drive_item(i) for i in data.get("value", [])]
+        items = self._filter_items(
+            [self._parse_drive_item(i) for i in data.get("value", [])],
+            enforce_folders=enforce_folder_block,
+        )
         return DriveItemList(items=items, total_items=len(items))
 
     async def get_item_async(self, item_id: str, drive_id: str | None = None) -> DriveItem | None:
@@ -253,19 +429,37 @@ class FilesHandler:
         resp = await self.msg.run_async(url=url, token=token)
         if resp is None or resp.status_code != 200:
             return None
-        return self._parse_drive_item(resp.json())
+        item = self._parse_drive_item(resp.json())
+        return self._apply_metadata_privacy(item)
 
     async def get_file_content_async(
-        self, item_id: str, drive_id: str | None = None
+        self, item_id: str, drive_id: str | None = None, *, allow_blocked: bool = False
     ) -> bytes | None:
         """Download the content of a file as bytes.
 
         If ``drive_id`` is None, uses the current user's default OneDrive.
         Returns None if the item is not found or is a folder.
+
+        ``allow_blocked`` is False by default (the AI/MCP path always enforces
+        privacy). A host UI may pass True ONLY for a file the owner explicitly
+        and deliberately selected from a blocked folder — this bypasses the
+        folder block and content/name block for that single file. Hidden files
+        are never returned regardless.
         """
         token = await self.msg.get_access_token_async()
         if not token:
             return None
+        item = await self.get_item_async(item_id, drive_id=drive_id)
+        if item is None or item.is_folder:
+            return None
+        if item.access_status == "folder_blocked" and not allow_blocked:
+            return None
+        if item.access_status == "content_blocked" and not allow_blocked:
+            raise OfficeContentBlockedError(item.access_reason or "Content access is blocked by your privacy settings.")
+        if allow_blocked:
+            # Normalize so the post-download content check recomputes cleanly.
+            item.access_status = "ok"
+            item.access_reason = ""
         if drive_id:
             url = f"{self.msg.msg_endpoint}drives/{drive_id}/items/{item_id}/content"
         else:
@@ -273,7 +467,156 @@ class FilesHandler:
         resp = await self.msg.run_async(url=url, token=token)
         if resp is None or resp.status_code != 200:
             return None
+        reason = self._content_block_reason(item, resp.content, enforce_folders=not allow_blocked)
+        if reason == "hidden":
+            return None
+        if reason and not allow_blocked:
+            raise OfficeContentBlockedError(reason)
         return resp.content
+
+    async def get_file_versions_async(
+        self,
+        item_id: str,
+        drive_id: str | None = None,
+        limit: int = 1,
+    ) -> DriveItemVersionList:
+        """List metadata for recent versions of a file."""
+        token = await self.msg.get_access_token_async()
+        if not token:
+            return DriveItemVersionList()
+        top = max(1, min(int(limit), 20))
+        if drive_id:
+            url = f"{self.msg.msg_endpoint}drives/{drive_id}/items/{item_id}/versions?$top={top}"
+        else:
+            url = f"{self.msg.msg_endpoint}me/drive/items/{item_id}/versions?$top={top}"
+        resp = await self.msg.run_async(url=url, token=token)
+        if resp is None or resp.status_code != 200:
+            return DriveItemVersionList()
+        data = resp.json()
+        versions = [self._parse_drive_item_version(v) for v in data.get("value", [])]
+        return DriveItemVersionList(versions=versions, total_versions=len(versions))
+
+    async def put_file_content_async(
+        self,
+        item_id: str,
+        content: bytes,
+        drive_id: str | None = None,
+        content_type: str = "application/octet-stream",
+    ) -> DriveItem | None:
+        """Overwrite one existing drive item with new bytes."""
+        token = await self.msg.get_access_token_async()
+        if not token:
+            return None
+        if drive_id:
+            url = f"{self.msg.msg_endpoint}drives/{drive_id}/items/{item_id}/content"
+        else:
+            url = f"{self.msg.msg_endpoint}me/drive/items/{item_id}/content"
+        resp = await self.msg.run_async(
+            url=url,
+            method="PUT",
+            data=content,
+            token=token,
+            add_headers={"Content-Type": content_type or "application/octet-stream"},
+        )
+        if resp is None or resp.status_code not in (200, 201):
+            if resp is None:
+                logger.warning("[GRAPH_FILES] PUT content failed for item %s: no response", item_id)
+            else:
+                logger.warning(
+                    "[GRAPH_FILES] PUT content failed for item %s: status=%s body=%s",
+                    item_id,
+                    resp.status_code,
+                    (resp.text or "")[:500],
+                )
+            return None
+        return self._parse_drive_item(resp.json())
+
+    async def upload_file_to_folder_async(
+        self,
+        folder_id: str,
+        filename: str,
+        content: bytes,
+        drive_id: str | None = None,
+        content_type: str = "application/octet-stream",
+    ) -> DriveItem | None:
+        """Create a file directly below a folder; fail if the name exists."""
+        token = await self.msg.get_access_token_async()
+        if not token:
+            return None
+        safe_name = quote(filename, safe="")
+        if drive_id:
+            url = (
+                f"{self.msg.msg_endpoint}drives/{drive_id}/items/{folder_id}:/{safe_name}:/content"
+                "?@microsoft.graph.conflictBehavior=fail"
+            )
+        else:
+            url = (
+                f"{self.msg.msg_endpoint}me/drive/items/{folder_id}:/{safe_name}:/content"
+                "?@microsoft.graph.conflictBehavior=fail"
+            )
+        resp = await self.msg.run_async(
+            url=url,
+            method="PUT",
+            data=content,
+            token=token,
+            add_headers={"Content-Type": content_type or "application/octet-stream"},
+        )
+        if resp is None or resp.status_code not in (200, 201):
+            if resp is None:
+                logger.warning("[GRAPH_FILES] Upload content failed for folder %s/%s: no response", folder_id, filename)
+            else:
+                logger.warning(
+                    "[GRAPH_FILES] Upload content failed for folder %s/%s: status=%s body=%s",
+                    folder_id,
+                    filename,
+                    resp.status_code,
+                    (resp.text or "")[:500],
+                )
+            return None
+        return self._parse_drive_item(resp.json())
+
+    async def create_folder_async(
+        self,
+        parent_id: str,
+        name: str,
+        drive_id: str | None = None,
+    ) -> DriveItem | None:
+        """Create a child folder. Existing folders are not overwritten."""
+        token = await self.msg.get_access_token_async()
+        if not token:
+            return None
+        if drive_id:
+            url = f"{self.msg.msg_endpoint}drives/{drive_id}/items/{parent_id}/children"
+        else:
+            url = f"{self.msg.msg_endpoint}me/drive/items/{parent_id}/children"
+        body = {
+            "name": name,
+            "folder": {},
+            "@microsoft.graph.conflictBehavior": "fail",
+        }
+        resp = await self.msg.run_async(url=url, method="POST", json=body, token=token)
+        if resp is None or resp.status_code not in (200, 201):
+            return None
+        return self._parse_drive_item(resp.json())
+
+    async def rename_item_async(
+        self,
+        item_id: str,
+        name: str,
+        drive_id: str | None = None,
+    ) -> DriveItem | None:
+        """Rename a drive item. Does not move or delete the item."""
+        token = await self.msg.get_access_token_async()
+        if not token:
+            return None
+        if drive_id:
+            url = f"{self.msg.msg_endpoint}drives/{drive_id}/items/{item_id}"
+        else:
+            url = f"{self.msg.msg_endpoint}me/drive/items/{item_id}"
+        resp = await self.msg.run_async(url=url, method="PATCH", json={"name": name}, token=token)
+        if resp is None or resp.status_code != 200:
+            return None
+        return self._parse_drive_item(resp.json())
 
     async def search_items_async(
         self, query: str, drive_id: str | None = None, limit: int = 25
@@ -304,7 +647,7 @@ class FilesHandler:
             if resp is None or resp.status_code != 200:
                 return DriveItemList()
             data = resp.json()
-            items = [self._parse_drive_item(i) for i in data.get("value", [])]
+            items = self._filter_items([self._parse_drive_item(i) for i in data.get("value", [])])
             return DriveItemList(items=items, total_items=len(items))
 
         # Tenant-wide unified search (OneDrive + SharePoint libraries).
@@ -330,7 +673,7 @@ class FilesHandler:
             if fallback is None or fallback.status_code != 200:
                 return DriveItemList()
             data = fallback.json()
-            items = [self._parse_drive_item(i) for i in data.get("value", [])]
+            items = self._filter_items([self._parse_drive_item(i) for i in data.get("value", [])])
             return DriveItemList(items=items, total_items=len(items))
         items: List[DriveItem] = []
         total = 0
@@ -340,7 +683,9 @@ class FilesHandler:
                 for hit in hits_container.get("hits", []):
                     resource = hit.get("resource")
                     if resource:
-                        items.append(self._parse_drive_item(resource))
+                        item = self._apply_metadata_privacy(self._parse_drive_item(resource))
+                        if item is not None:
+                            items.append(item)
         # Fall back to the parsed-hit count when the API omits ``total``.
         return DriveItemList(items=items, total_items=total or len(items))
 
@@ -385,3 +730,16 @@ class FilesHandler:
         data = resp.json()
         drives = [self._parse_drive(d) for d in data.get("value", [])]
         return DriveList(drives=drives, total_drives=len(drives))
+
+    async def get_team_channel_files_folder_async(
+        self, team_id: str, channel_id: str
+    ) -> DriveItem | None:
+        """Get the SharePoint-backed files folder for a Teams channel."""
+        token = await self.msg.get_access_token_async()
+        if not token:
+            return None
+        url = f"{self.msg.msg_endpoint}teams/{team_id}/channels/{channel_id}/filesFolder"
+        resp = await self.msg.run_async(url=url, token=token)
+        if resp is None or resp.status_code != 200:
+            return None
+        return self._parse_drive_item(resp.json())
