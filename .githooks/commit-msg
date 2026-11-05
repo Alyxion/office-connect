@@ -1,0 +1,3 @@
+#!/bin/sh
+# Public repository: block internal names in the commit message (scripts/content_guard.py).
+exec python3 "$(git rev-parse --show-toplevel)/scripts/content_guard.py" --message "$1"

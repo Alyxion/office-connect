@@ -470,6 +470,18 @@ class MockGraphTransport:
                         value.append(item)
                     return _make_response(200, {"value": value})
             return _make_response(200, {"value": []})
+        # GET me/messages/{id}/attachments/{att_id} — single attachment WITH
+        # contentBytes (the lazy-download path used by o365_peek_mail_attachment).
+        if len(parts) >= 4 and parts[-2] == "attachments":
+            att_msg_id, att_id = parts[-3], parts[-1]
+            for msg in self._profile.mail_messages:
+                if msg.get("id") == att_msg_id:
+                    for i, att in enumerate(msg.get("attachments", [])):
+                        if (att.get("id") or f"{att_msg_id}-att{i}") == att_id:
+                            item = dict(att)
+                            item.setdefault("id", att_id)
+                            return _make_response(200, item)
+            return _make_response(404, {"error": {"code": "ErrorItemNotFound"}})
         msg_id = parts[-1] if len(parts) >= 2 else ""
         for msg in self._profile.mail_messages:
             if msg.get("id") == msg_id:

@@ -5,7 +5,8 @@ Provides file access to:
 - Drive items (files and folders)
 - SharePoint sites
 - File content download
-- Explicit file/folder writes for whitelisted callers; no delete helper
+- Explicit file/folder writes (incl. path-based, conditional and large uploads,
+  move) for whitelisted callers; no delete helper
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from urllib.parse import quote
 
 from pydantic import BaseModel, Field
 
+from office_con.msgraph.errors import DriveItemConflictError, GraphRequestError
 from office_con.privacy import (
     OfficeContentBlockedError,
     any_text_matches,
@@ -446,11 +448,17 @@ class FilesHandler:
         folder block and content/name block for that single file. Hidden files
         are never returned regardless.
         """
-        token = await self.msg.get_access_token_async()
-        if not token:
-            return None
         item = await self.get_item_async(item_id, drive_id=drive_id)
-        if item is None or item.is_folder:
+        if item is None:
+            return None
+        return await self._download_item_async(item, drive_id, allow_blocked=allow_blocked)
+
+    async def _download_item_async(
+        self, item: DriveItem, drive_id: str | None, *, allow_blocked: bool
+    ) -> bytes | None:
+        """Content of an already-resolved item, with the privacy checks applied."""
+        token = await self.msg.get_access_token_async()
+        if not token or item.is_folder:
             return None
         if item.access_status == "folder_blocked" and not allow_blocked:
             return None
@@ -461,9 +469,9 @@ class FilesHandler:
             item.access_status = "ok"
             item.access_reason = ""
         if drive_id:
-            url = f"{self.msg.msg_endpoint}drives/{drive_id}/items/{item_id}/content"
+            url = f"{self.msg.msg_endpoint}drives/{drive_id}/items/{item.id}/content"
         else:
-            url = f"{self.msg.msg_endpoint}me/drive/items/{item_id}/content"
+            url = f"{self.msg.msg_endpoint}me/drive/items/{item.id}/content"
         resp = await self.msg.run_async(url=url, token=token)
         if resp is None or resp.status_code != 200:
             return None
@@ -650,44 +658,191 @@ class FilesHandler:
             items = self._filter_items([self._parse_drive_item(i) for i in data.get("value", [])])
             return DriveItemList(items=items, total_items=len(items))
 
-        # Tenant-wide unified search (OneDrive + SharePoint libraries).
-        body = {
-            "requests": [{
-                "entityTypes": ["driveItem"],
-                "query": {"queryString": query},
-                "from": 0,
-                "size": limit,
-            }]
-        }
-        resp = await self.msg.run_async(
-            url=f"{self.msg.msg_endpoint}search/query",
-            method="POST", json=body, token=token,
-        )
-        if resp is None or resp.status_code != 200:
-            # Compatibility fallback: some tenants/apps do not have Microsoft
-            # Search enabled or consented. Preserve the old personal-OneDrive
-            # search behavior instead of returning a misleading empty result.
-            safe_query = query.replace("'", "''")
-            url = f"{self.msg.msg_endpoint}me/drive/root/search(q='{safe_query}')?$top={limit}"
-            fallback = await self.msg.run_async(url=url, token=token)
-            if fallback is None or fallback.status_code != 200:
-                return DriveItemList()
-            data = fallback.json()
-            items = self._filter_items([self._parse_drive_item(i) for i in data.get("value", [])])
-            return DriveItemList(items=items, total_items=len(items))
+        # Tenant-wide unified search (OneDrive + SharePoint libraries), paged
+        # while Graph reports more results and *limit* is not reached.
+        page_size = min(limit, 200)
         items: List[DriveItem] = []
         total = 0
-        for container in resp.json().get("value", []):
-            for hits_container in container.get("hitsContainers", []):
-                total = hits_container.get("total", total)
-                for hit in hits_container.get("hits", []):
-                    resource = hit.get("resource")
-                    if resource:
-                        item = self._apply_metadata_privacy(self._parse_drive_item(resource))
-                        if item is not None:
-                            items.append(item)
+        start = 0
+        while len(items) < limit:
+            body = {
+                "requests": [{
+                    "entityTypes": ["driveItem"],
+                    "query": {"queryString": query},
+                    "from": start,
+                    "size": page_size,
+                }]
+            }
+            resp = await self.msg.run_async(
+                url=f"{self.msg.msg_endpoint}search/query",
+                method="POST", json=body, token=token,
+            )
+            if resp is None or resp.status_code != 200:
+                if start:
+                    break  # later page failed — keep what the earlier pages found
+                # Compatibility fallback: some tenants/apps do not have Microsoft
+                # Search enabled or consented. Preserve the old personal-OneDrive
+                # search behavior instead of returning a misleading empty result.
+                safe_query = query.replace("'", "''")
+                url = f"{self.msg.msg_endpoint}me/drive/root/search(q='{safe_query}')?$top={limit}"
+                fallback = await self.msg.run_async(url=url, token=token)
+                if fallback is None or fallback.status_code != 200:
+                    return DriveItemList()
+                data = fallback.json()
+                items = self._filter_items([self._parse_drive_item(i) for i in data.get("value", [])])
+                return DriveItemList(items=items, total_items=len(items))
+            more = False
+            for container in resp.json().get("value", []):
+                for hits_container in container.get("hitsContainers", []):
+                    total = hits_container.get("total", total)
+                    more = more or bool(hits_container.get("moreResultsAvailable"))
+                    for hit in hits_container.get("hits", []):
+                        resource = hit.get("resource")
+                        if resource:
+                            item = self._apply_metadata_privacy(self._parse_drive_item(resource))
+                            if item is not None:
+                                items.append(item)
+            if not more:
+                break
+            start += page_size
         # Fall back to the parsed-hit count when the API omits ``total``.
-        return DriveItemList(items=items, total_items=total or len(items))
+        return DriveItemList(items=items[:limit], total_items=total or len(items))
+
+    # ── async API — path-based access to the user's OneDrive ──────────────
+
+    # Graph's simple PUT takes up to 4 MB; larger files need an upload session.
+    _SIMPLE_UPLOAD_LIMIT = 4 * 1024 * 1024
+
+    def _path_url(self, path: str, suffix: str = "") -> str:
+        """``me/drive/root:/<path>:<suffix>`` — *path* is relative to the drive root."""
+        return f"{self.msg.msg_endpoint}me/drive/root:/{quote(path.strip('/'), safe='/')}:{suffix}"
+
+    async def get_item_by_path_async(self, path: str) -> DriveItem | None:
+        """Metadata of the item at *path* (relative to the OneDrive root), or None."""
+        token = await self.msg.get_access_token_async()
+        if not token:
+            return None
+        resp = await self.msg.run_async(url=self._path_url(path), token=token)
+        if resp is None or resp.status_code == 404:
+            return None
+        if resp.status_code != 200:
+            raise GraphRequestError(f"get_item_by_path_async — {path}", resp.status_code, resp.text or "")
+        return self._apply_metadata_privacy(self._parse_drive_item(resp.json()))
+
+    async def get_file_content_by_path_async(
+        self, path: str, *, allow_blocked: bool = False
+    ) -> tuple[bytes, DriveItem] | None:
+        """Content + metadata (incl. ``e_tag`` for a later conditional write) of
+        the file at *path*, or None when it does not exist."""
+        item = await self.get_item_by_path_async(path)
+        if item is None:
+            return None
+        content = await self._download_item_async(item, None, allow_blocked=allow_blocked)
+        if content is None:
+            raise GraphRequestError(f"get_file_content_by_path_async — {path}", None)
+        return content, item
+
+    async def upload_file_by_path_async(
+        self,
+        path: str,
+        content: bytes,
+        *,
+        if_match: str | None = None,
+        create_only: bool = False,
+        content_type: str = "application/octet-stream",
+    ) -> DriveItem:
+        """Write *content* to *path*, creating missing parent folders.
+
+        Optimistic concurrency: with *if_match* (an ``e_tag``) the write only
+        succeeds if the item is unchanged; with *create_only* only if it does
+        not exist yet. A lost race raises :class:`DriveItemConflictError`, any
+        other failure :class:`GraphRequestError`. Files above 4 MB go through
+        an upload session automatically.
+        """
+        token = await self.msg.get_access_token_async()
+        if not token:
+            raise GraphRequestError(f"upload_file_by_path_async — {path}: no access token", None)
+        headers = {"If-Match": if_match} if if_match else {}
+        conflict = "fail" if create_only else "replace"
+        if len(content) <= self._SIMPLE_UPLOAD_LIMIT:
+            resp = await self.msg.run_async(
+                url=self._path_url(path, f"/content?@microsoft.graph.conflictBehavior={conflict}"),
+                method="PUT",
+                data=content,
+                token=token,
+                add_headers={"Content-Type": content_type or "application/octet-stream", **headers},
+            )
+            self._raise_for_write(resp, path)
+            return self._parse_drive_item(resp.json())
+        session = await self.msg.run_async(
+            url=self._path_url(path, "/createUploadSession"),
+            method="POST",
+            json={"item": {"@microsoft.graph.conflictBehavior": conflict}},
+            token=token,
+            add_headers=headers or None,
+        )
+        self._raise_for_write(session, path)
+        result = await self.msg.upload_session_async(session.json()["uploadUrl"], content)
+        if not result:
+            raise GraphRequestError(f"upload_file_by_path_async — {path}: upload session failed", None)
+        return self._parse_drive_item(result)
+
+    @staticmethod
+    def _raise_for_write(resp, path: str) -> None:
+        if resp is not None and resp.status_code in (200, 201):
+            return
+        status = getattr(resp, "status_code", None)
+        body = getattr(resp, "text", "") or ""
+        if status in (409, 412):
+            raise DriveItemConflictError(f"{path} changed or already exists", status, body)
+        logger.warning("[GRAPH_FILES] write %s failed: status=%s body=%s", path, status, body[:500])
+        raise GraphRequestError(f"write {path}", status, body)
+
+    async def create_folder_path_async(self, path: str) -> DriveItem | None:
+        """Ensure the folder *path* exists (with all parents); existing folders are kept."""
+        token = await self.msg.get_access_token_async()
+        if not token:
+            return None
+        item = await self.get_item_by_path_async(path)
+        if item is not None:
+            return item if item.is_folder else None
+        parent_path, _, name = path.strip("/").rpartition("/")
+        if parent_path:
+            parent = await self.create_folder_path_async(parent_path)
+            if parent is None:
+                return None
+            created = await self.create_folder_async(parent.id, name)
+        else:
+            resp = await self.msg.run_async(
+                url=f"{self.msg.msg_endpoint}me/drive/root/children", method="POST", token=token,
+                json={"name": name, "folder": {}, "@microsoft.graph.conflictBehavior": "fail"},
+            )
+            created = self._parse_drive_item(resp.json()) if resp is not None and resp.status_code in (200, 201) else None
+        # A parallel caller may have created it in between — re-read instead of failing.
+        return created or await self.get_item_by_path_async(path)
+
+    async def move_item_async(
+        self,
+        item_id: str,
+        parent_id: str,
+        name: str | None = None,
+        drive_id: str | None = None,
+    ) -> DriveItem | None:
+        """Move an item below another folder (optionally renaming it). Nothing is deleted."""
+        token = await self.msg.get_access_token_async()
+        if not token:
+            return None
+        if drive_id:
+            url = f"{self.msg.msg_endpoint}drives/{drive_id}/items/{item_id}"
+        else:
+            url = f"{self.msg.msg_endpoint}me/drive/items/{item_id}"
+        body: dict = {"parentReference": {"id": parent_id}}
+        if name:
+            body["name"] = name
+        resp = await self.msg.run_async(url=url, method="PATCH", json=body, token=token)
+        if resp is None or resp.status_code != 200:
+            return None
+        return self._parse_drive_item(resp.json())
 
     # ── async API — SharePoint sites ──────────────────────────────────────
 

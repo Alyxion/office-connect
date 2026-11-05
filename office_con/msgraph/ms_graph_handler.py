@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import logging
 import time as _time
@@ -11,6 +12,7 @@ from msal import ConfidentialClientApplication
 from office_con.msgraph.mail_handler import OfficeMailHandler, MailFolderHandler
 from office_con.msgraph.profile_handler import ProfileHandler, UserProfile
 from office_con.msgraph.calendar_handler import CalendarHandler
+from office_con.msgraph.errors import DriveItemConflictError, GraphRequestError  # noqa: F401  (re-export)
 from office_con.privacy import OfficePrivacyConfig
 from ..web_user_instance import WebUserInstance
 
@@ -69,6 +71,15 @@ class AuthExpiredError(RuntimeError):
     """
 
 
+# The public (global) Microsoft Graph v1.0 endpoint — used unless the caller or
+# $O365_ENDPOINT names another cloud (e.g. a national cloud).
+DEFAULT_GRAPH_ENDPOINT = "https://graph.microsoft.com/v1.0/"
+
+# Upload sessions (large mail attachments, large drive files) take the bytes in
+# chunks that must be multiples of 320 KiB.
+UPLOAD_CHUNK_SIZE = 320 * 1024 * 16
+
+
 class MsGraphInstance(WebUserInstance):
 
     def __init__(self, scopes: list[str] | None = None,
@@ -91,7 +102,7 @@ class MsGraphInstance(WebUserInstance):
 
         self.client_id = client_id or os.environ.get('O365_CLIENT_ID')
         self.client_secret = client_secret or os.environ.get('O365_CLIENT_SECRET')
-        self.msg_endpoint = endpoint or os.environ.get("O365_ENDPOINT")
+        self.msg_endpoint = endpoint or os.environ.get("O365_ENDPOINT") or DEFAULT_GRAPH_ENDPOINT
         self.tenant_id = tenant_id or os.environ.get("O365_TENANT_ID", "common")
         self.authority = f"https://login.microsoftonline.com/{self.tenant_id}"
 
@@ -351,6 +362,34 @@ class MsGraphInstance(WebUserInstance):
         except Exception as exc:
             logger.error("[OP] azure_ad_token_request(%s) — failed (%.0fms, pid=%d): %s", grant_type, (_time.monotonic() - _t0) * 1000, _pid, exc)
             return {"error": "async_request_failed", "error_description": str(exc)}
+
+    async def upload_session_async(self, upload_url: str, content: bytes) -> dict | None:
+        """Send *content* to a pre-authenticated upload-session URL in chunks.
+
+        The URL carries its own credentials — it must NOT receive the bearer
+        token (Graph rejects that with 401). Returns the JSON of the final
+        chunk's response (the created item) or None when a chunk failed.
+        """
+        size = len(content)
+        if self._mock_transport is not None:
+            response = await self._mock_transport.handle_request(upload_url, "PUT", None)
+            return response.json() if response is not None and response.status_code in (200, 201) else None
+        timeout = aiohttp.ClientTimeout(total=120, sock_connect=10)
+        result: dict | None = {}
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for start in range(0, size, UPLOAD_CHUNK_SIZE):
+                chunk = content[start:start + UPLOAD_CHUNK_SIZE]
+                end = start + len(chunk) - 1
+                headers = {"Content-Length": str(len(chunk)), "Content-Range": f"bytes {start}-{end}/{size}"}
+                async with session.put(upload_url, data=chunk, headers=headers) as response:
+                    text = await response.text()
+                    logger.info("[OP] PUT upload-session chunk %d-%d/%d -> %s", start, end, size, response.status)
+                    if response.status not in (200, 201, 202):
+                        logger.warning("[OP] upload session failed: status=%s body=%s", response.status, text[:300])
+                        return None
+                    if response.status in (200, 201) and text:
+                        result = json.loads(text)
+        return result
 
     def get_mail(self):
         return OfficeMailHandler(self)

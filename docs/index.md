@@ -211,6 +211,8 @@ Tokens are automatically refreshed and persisted back to the keyfile.
 - [Session Layer](session_layer.md)
 - [Handlers](handlers.md)
 - [MCP Servers](mcp_servers.md)
+- [Mail attachments & local file server](file_server.md)
+- [Testing the MCP server (e2e client)](mcp_testing.md)
 - [Company Directory](company_directory.md)
 - [Utilities](utilities.md)
 - [Azure AD Permissions](azure_ad_permissions.md)

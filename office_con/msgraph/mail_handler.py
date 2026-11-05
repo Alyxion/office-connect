@@ -2,11 +2,12 @@ import base64
 import hashlib
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import List, Optional, Dict
 
 from pydantic import BaseModel, Field
 
+from office_con.msgraph.errors import GraphRequestError
 from office_con.privacy import any_text_matches
 
 from typing import TYPE_CHECKING, Literal
@@ -38,7 +39,7 @@ class OfficeMailCategory(BaseModel):
 
 class MailAddress(BaseModel):
     """A single recipient/sender mailbox: display name + SMTP address."""
-    name: str | None = Field(default=None, description="Display name, e.g. 'Michael Ikemann'")
+    name: str | None = Field(default=None, description="Display name, e.g. 'Jane Doe'")
     address: str | None = Field(default=None, description="SMTP email address, e.g. 'm@example.com'")
     legacy_dn: str | None = Field(
         default=None,
@@ -119,6 +120,13 @@ class MoveResult(BaseModel):
     """Result of moving a message to another folder."""
     id: str = Field(description="New message id in the destination folder")
     web_link: str = Field(default="", description="Outlook Web App URL")
+
+
+class OfficeDraft(BaseModel):
+    """A draft saved in the Drafts folder (never sent)."""
+    id: str = Field(description="MS Graph message id of the draft")
+    web_link: str = Field(default="", description="Outlook Web App URL to open the draft")
+    failed_attachments: List[str] = Field(default_factory=list, description="Names of attachments that could not be uploaded")
 
 
 def compute_folder_signature(rows: list[dict]) -> str:
@@ -756,6 +764,71 @@ class OfficeMailHandler:
         await self.resolve_legacy_addresses_async(email_list)
         return OfficeMailList(elements=email_list, total_mails=total_count)
 
+    async def list_messages_async(
+        self, *,
+        folder: str | None = None,
+        received_since: date | datetime | None = None,
+        has_attachments: bool | None = None,
+        subject_prefix: str | None = None,
+        limit: int = 5000,
+    ) -> OfficeMailList:
+        """Every message matching the filters (header metadata only), paged.
+
+        Unlike ``email_index_async`` (one page, empty on failure) this follows
+        ``@odata.nextLink`` until *limit* and raises :class:`GraphRequestError`
+        on any non-200 — a complete listing must never degrade to a silently
+        empty one. *folder* scopes to a well-known name or folder id; without it
+        the whole mailbox is listed. With *received_since* the result is newest
+        first.
+        """
+        access_token = await self.msg.get_access_token_async()
+        if not access_token:
+            return OfficeMailList()
+        clauses: list[str] = []
+        # Graph requires the $orderby property to come FIRST in $filter —
+        # otherwise it answers 400 InefficientFilter.
+        if received_since is not None:
+            since = received_since if isinstance(received_since, datetime) else datetime(
+                received_since.year, received_since.month, received_since.day, tzinfo=timezone.utc)
+            if since.tzinfo is None:
+                since = since.replace(tzinfo=timezone.utc)
+            clauses.append(f"receivedDateTime ge {since.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}")
+        if has_attachments is not None:
+            clauses.append(f"hasAttachments eq {'true' if has_attachments else 'false'}")
+        if subject_prefix:
+            safe_prefix = subject_prefix.replace("'", "''")
+            clauses.append(f"startswith(subject,'{safe_prefix}')")
+        scope_folder = resolve_well_known_folder(folder)
+        container = f"mailFolders/{scope_folder}/messages" if scope_folder else "messages"
+        params = [f"$select={self._INDEX_FIELDS}", f"$top={min(limit, 100)}"]
+        if clauses:
+            params.append("$filter=" + " and ".join(clauses))
+        if received_since is not None:
+            params.append("$orderby=receivedDateTime desc")
+        url: str | None = f"{self.msg.msg_endpoint}me/{container}?" + "&".join(params)
+
+        end_point = (self.msg.msg_endpoint or "").rstrip('/')
+        email_list: list[OfficeMail] = []
+        while url and len(email_list) < limit:
+            response = await self.msg.run_async(url=url, token=access_token)
+            if response is None or response.status_code != 200:
+                raise GraphRequestError(
+                    "list_messages_async — Graph rejected the listing",
+                    getattr(response, "status_code", None), getattr(response, "text", "") or "",
+                )
+            json_object = response.json()
+            for email in json_object.get('value', []):
+                new_mail = self.parse_mail(email)
+                new_mail.email_url = f"{end_point}/me/messages/{new_mail.email_id}"
+                new_mail.graph_url = new_mail.email_url
+                visible_mail = self._apply_mail_privacy(new_mail)
+                if visible_mail is not None:
+                    email_list.append(visible_mail)
+            url = json_object.get("@odata.nextLink")
+        email_list = email_list[:limit]
+        await self.resolve_legacy_addresses_async(email_list)
+        return OfficeMailList(elements=email_list, total_mails=len(email_list))
+
     # Fields requested from /search/query (Graph property names, mirroring
     # _INDEX_FIELDS). Header metadata only — no body — to keep payloads small.
     _SEARCH_FIELDS = [
@@ -1131,49 +1204,168 @@ class OfficeMailHandler:
 
     # ── Draft lifecycle (async) ───────────────────────────────────────────
 
-    async def _add_attachments_async(self, message_id: str, attachments: List[OfficeMailAttachment], access_token: str) -> int:
-        """Add attachments to an existing message. Returns count of successfully added."""
-        added = 0
+    # Graph accepts inline ``contentBytes`` up to 3 MB; larger files need an upload session.
+    _SIMPLE_ATTACHMENT_LIMIT = 3 * 1024 * 1024
+
+    async def add_attachment_async(self, message_id: str, attachment: OfficeMailAttachment) -> bool:
+        """Attach one file to an existing message (typically a draft).
+
+        Files up to 3 MB go inline; larger ones through an upload session —
+        the plain POST fails for them with 413.
+        """
+        if not attachment.content_bytes:
+            _log.warning("[MailHandler]   skip att %s: no content_bytes", attachment.name)
+            return False
+        access_token = await self.msg.get_access_token_async()
+        if not access_token:
+            return False
+        size = len(attachment.content_bytes)
+        _log.info("[MailHandler]   adding att: %s (%s, %d bytes)", attachment.name, attachment.content_type, size)
         url = f"{self.msg.msg_endpoint}me/messages/{message_id}/attachments"
-        _log.info("[MailHandler] _add_attachments_async: msg=%s, count=%d",
-                  message_id[:20] if message_id else None, len(attachments))
-        for att in attachments:
-            if not att.content_bytes:
-                _log.warning("[MailHandler]   skip att %s: no content_bytes", att.name)
-                continue
-            _log.info("[MailHandler]   adding att: %s (%s, %d bytes)",
-                      att.name, att.content_type, len(att.content_bytes))
+        if size <= self._SIMPLE_ATTACHMENT_LIMIT:
             payload = {
                 "@odata.type": "#microsoft.graph.fileAttachment",
-                "name": att.name,
-                "contentType": att.content_type,
-                "contentBytes": base64.b64encode(att.content_bytes).decode(),
+                "name": attachment.name,
+                "contentType": attachment.content_type,
+                "contentBytes": base64.b64encode(attachment.content_bytes).decode(),
             }
             resp = await self.msg.run_async(url=url, method="POST", json=payload, token=access_token)
-            _log.info("[MailHandler]   response: status=%s", resp.status_code if resp is not None else None)
-            if resp is not None and resp.status_code == 201:
+            ok = resp is not None and resp.status_code == 201
+        else:
+            session = await self.msg.run_async(
+                url=f"{url}/createUploadSession", method="POST", token=access_token,
+                json={"AttachmentItem": {"attachmentType": "file", "name": attachment.name, "size": size,
+                                         "contentType": attachment.content_type}},
+            )
+            ok = (session is not None and session.status_code == 201
+                  and await self.msg.upload_session_async(session.json()["uploadUrl"], attachment.content_bytes) is not None)
+            resp = session
+        if not ok:
+            body_text = ""
+            try:
+                body_text = resp.text[:500] if resp else "None"
+            except Exception:
+                pass
+            _log.warning("[MailHandler]   FAILED to add attachment %s: status=%s body=%s",
+                         attachment.name, resp.status_code if resp is not None else None, body_text)
+        return ok
+
+    async def _add_attachments_async(self, message_id: str, attachments: List[OfficeMailAttachment], access_token: str) -> int:
+        """Add attachments to an existing message. Returns count of successfully added."""
+        _log.info("[MailHandler] _add_attachments_async: msg=%s, count=%d",
+                  message_id[:20] if message_id else None, len(attachments))
+        added = 0
+        for att in attachments:
+            if await self.add_attachment_async(message_id, att):
                 added += 1
-            else:
-                body_text = ""
-                try:
-                    body_text = resp.text[:500] if resp else "None"
-                except Exception:
-                    pass
-                _log.warning("[MailHandler]   FAILED to add attachment %s: status=%s body=%s",
-                             att.name, resp.status_code if resp is not None else None, body_text)
         _log.info("[MailHandler] _add_attachments_async: added %d/%d", added, len(attachments))
         return added
 
+    async def list_attachments_async(self, message_id: str) -> List[OfficeMailAttachment]:
+        """Attachment metadata of a message (no content bytes)."""
+        access_token = await self.msg.get_access_token_async()
+        if not access_token:
+            return []
+        resp = await self.msg.run_async(
+            url=f"{self.msg.msg_endpoint}me/messages/{message_id}/attachments"
+                "?$select=id,name,contentType,size,isInline",
+            token=access_token,
+        )
+        if resp is None or resp.status_code != 200:
+            return []
+        return [
+            OfficeMailAttachment(
+                attachment_id=att.get("id"),
+                name=att.get("name") or "",
+                content_type=att.get("contentType") or "application/octet-stream",
+                size=att.get("size"),
+                is_embedded=bool(att.get("isInline")),
+            )
+            for att in resp.json().get("value", [])
+        ]
+
+    async def clear_attachments_async(self, message_id: str) -> int:
+        """Remove all attachments from a message (e.g. before re-attaching an
+        edited file to a draft). Returns the number removed."""
+        access_token = await self.msg.get_access_token_async()
+        if not access_token:
+            return 0
+        removed = 0
+        url = f"{self.msg.msg_endpoint}me/messages/{message_id}/attachments"
+        for att in await self.list_attachments_async(message_id):
+            resp = await self.msg.run_async(url=f"{url}/{att.attachment_id}", method="DELETE", token=access_token)
+            if resp is not None and resp.status_code < 300:
+                removed += 1
+        return removed
+
     async def _clear_attachments_async(self, message_id: str, access_token: str) -> None:
         """Remove all attachments from a message."""
-        url = f"{self.msg.msg_endpoint}me/messages/{message_id}/attachments"
-        resp = await self.msg.run_async(url=url, method="GET", token=access_token)
-        if resp is None or resp.status_code != 200:
-            return
-        for att in resp.json().get("value", []):
-            att_id = att.get("id")
-            if att_id:
-                await self.msg.run_async(url=f"{url}/{att_id}", method="DELETE", token=access_token)
+        await self.clear_attachments_async(message_id)
+
+    async def save_draft_async(
+        self,
+        to_recipients: List[str],
+        subject: str,
+        body: str,
+        is_html: bool = True,
+        cc_recipients: Optional[List[str]] = None,
+        bcc_recipients: Optional[List[str]] = None,
+        attachments: Optional[List[OfficeMailAttachment]] = None,
+    ) -> Optional[OfficeDraft]:
+        """Create a draft with attachments (any size) and report which uploads
+        failed. Nothing is sent — the user reviews and sends it in Outlook."""
+        access_token = await self.msg.get_access_token_async()
+        if not access_token:
+            return None
+        message = self._build_message_payload(
+            to_recipients, subject, body, is_html,
+            cc_recipients, bcc_recipients,
+        )
+        message["isDraft"] = True
+        resp = await self.msg.run_async(
+            url=f"{self.msg.msg_endpoint}me/messages", method="POST", json=message, token=access_token,
+        )
+        if resp is None or resp.status_code != 201:
+            return None
+        data = resp.json()
+        draft = OfficeDraft(id=data.get("id", ""), web_link=data.get("webLink", ""))
+        for att in attachments or []:
+            if not await self.add_attachment_async(draft.id, att):
+                draft.failed_attachments.append(att.name)
+        return draft
+
+    async def patch_draft_async(
+        self,
+        message_id: str,
+        *,
+        subject: str | None = None,
+        body: str | None = None,
+        is_html: bool = True,
+        to_recipients: Optional[List[str]] = None,
+        cc_recipients: Optional[List[str]] = None,
+    ) -> bool:
+        """Change only the given fields of a draft (``update_draft_async``
+        rewrites all of them). Attachments stay untouched."""
+        access_token = await self.msg.get_access_token_async()
+        if not access_token:
+            return False
+        def fmt(addrs):
+            return [{"emailAddress": {"address": a}} for a in addrs if a]
+        fields: Dict = {}
+        if subject is not None:
+            fields["subject"] = subject
+        if body is not None:
+            fields["body"] = {"contentType": "HTML" if is_html else "Text", "content": body}
+        if to_recipients is not None:
+            fields["toRecipients"] = fmt(to_recipients)
+        if cc_recipients is not None:
+            fields["ccRecipients"] = fmt(cc_recipients)
+        if not fields:
+            return True
+        resp = await self.msg.run_async(
+            url=f"{self.msg.msg_endpoint}me/messages/{message_id}", method="PATCH", json=fields, token=access_token,
+        )
+        return resp is not None and resp.status_code == 200
 
     async def create_draft_async(
         self,

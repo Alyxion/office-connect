@@ -107,7 +107,7 @@ class TestServerSetup:
 
     def test_tool_count(self):
         """All read + draft + all-tier tools. Update this when adding new tools."""
-        assert len(TOOLS) == 45
+        assert len(TOOLS) == 46
 
     def test_tool_names_unique(self):
         names = [t.name for t in TOOLS]
@@ -593,6 +593,8 @@ class TestToolCoverage:
             "o365_search_messages",
             "o365_peek_drive_file",
             "o365_peek_mail_attachment",
+            # Covered end-to-end in tests/test_mcp_client_e2e.py (mock MCP client):
+            "o365_get_mail_attachment",
         }
         read_only_tools = {
             name for name, lvl in TOOL_PERMISSIONS.items()

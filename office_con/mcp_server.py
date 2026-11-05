@@ -32,6 +32,15 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
+from office_con.auth.browser_login import (
+    DEFAULT_REDIRECT_HOST,
+    DEFAULT_REDIRECT_PATH,
+    DEFAULT_REDIRECT_PORT,
+    DEFAULT_TLS_DIR,
+    BrowserLoginError,
+    build_redirect_uri,
+    run_browser_login,
+)
 from office_con.mcp_permissions import (
     DEFAULT_LEVEL,
     ENV_VAR as PERMISSION_ENV_VAR,
@@ -42,11 +51,13 @@ from office_con.mcp_permissions import (
     resolve_level,
 )
 from office_con.msgraph.ms_graph_handler import AuthExpiredError, MsGraphInstance
+from office_con.file_server import LocalFileServer
 from office_con.privacy import OfficeContentBlockedError, any_text_matches, decode_text_for_rules
 from office_con.logging_setup import (
     LOG_FILE_ENV,
     LOG_LEVEL_ENV,
     configure_logging,
+    is_server_environment,
 )
 
 logger = logging.getLogger(__name__)
@@ -114,6 +125,35 @@ async def _create_graph(keyfile: str) -> MsGraphInstance:
     """Create an authenticated MsGraphInstance from a key file."""
     from pathlib import Path as _Path
     data = await asyncio.to_thread(lambda: json.loads(_Path(keyfile).read_text()))
+
+    # ── Offline test mode ────────────────────────────────────────────────
+    # A keyfile may request synthetic data so the stdio server can be driven
+    # end-to-end without Office 365 credentials (see docs/mcp_testing.md). This
+    # is triple-gated and CANNOT activate in production: the keyfile must set
+    # "mock": true, AND is_mock_enabled() must hold (env LLMING_MOCK_USERS=1 and
+    # no Azure App Service / production signals). Every Graph + token call is
+    # then served by MockGraphTransport, so nothing touches the network.
+    if data.get("mock") is True:
+        from office_con.testing import is_mock_enabled
+        if not is_mock_enabled():
+            raise RuntimeError(
+                "keyfile requests mock mode but it is not enabled. Set "
+                "LLMING_MOCK_USERS=1 (and ensure no production environment "
+                "markers are present)."
+            )
+        from office_con.testing.fixtures import default_mock_profile
+        from office_con.testing.mock_tokens import make_mock_access_token
+        profile = default_mock_profile()
+        mock_inst = MsGraphInstance(
+            endpoint=data.get("endpoint", "https://graph.microsoft.com/v1.0/"),
+        )
+        mock_inst.enable_mock(profile)
+        mock_inst.email = profile.email
+        mock_inst.cache_dict["access_token"] = make_mock_access_token(
+            profile.email, profile.user_id,
+        )
+        logger.warning("[MCP] MOCK MODE active — serving synthetic data, no network calls")
+        return mock_inst
 
     inst = MsGraphInstance(
         scopes=None,
@@ -221,8 +261,8 @@ TOOLS = [
             "Get a single email by ID, including body and attachments metadata. "
             "Attachments are listed as metadata only (attachment_id, name, content_type, "
             "size) — the bytes are NOT downloaded here (that previously timed out on "
-            "large PDFs); read an attachment lazily with o365_peek_mail_attachment using "
-            "its attachment_id. "
+            "large PDFs); preview an attachment with o365_peek_mail_attachment or fetch "
+            "its full bytes with o365_get_mail_attachment, using its attachment_id. "
             "Use body_format='text' to avoid bloated HTML; bodies over max_body_chars "
             "are truncated with body_truncated=true (raise max_body_chars or pass "
             "body_format='text' to get the rest). Meeting-request mails include event_id "
@@ -854,6 +894,38 @@ TOOLS = [
         },
     ),
     Tool(
+        name="o365_get_mail_attachment",
+        description=(
+            "Download an email attachment's FULL bytes as base64 (the original "
+            "file, not a preview). Use IDs from o365_get_mail. This is the bytes "
+            "path that o365_get_mail deliberately omits and o365_peek_mail_attachment "
+            "only previews — use it to re-attach a mailed file (e.g. a receipt PDF) "
+            "to a new draft: pass the returned content_base64, name and content_type "
+            "to o365_create_mail_draft / o365_update_mail_draft attachments. The "
+            "base64 enters the model context, so this is for one or a few files, not "
+            "bulk dumps; over max_bytes it is refused. Item/reference attachments "
+            "(no inline content) cannot be returned this way. If the server runs "
+            "with --file-server, delivery defaults to an unguessable loopback URL "
+            "(no payload in context); pass delivery='base64' if your fetcher is "
+            "network-isolated and cannot reach 127.0.0.1."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "email_id": {"type": "string", "description": "Message id"},
+                "attachment_id": {"type": "string", "description": "Attachment id from o365_get_mail"},
+                "delivery": {
+                    "type": "string",
+                    "enum": ["auto", "base64", "url"],
+                    "description": "auto = URL if the file server is enabled, else base64; url = loopback URL (errors if file server off); base64 = inline bytes, capped by max_bytes (use this when the fetcher is network-isolated and cannot reach 127.0.0.1, even with the file server on). Default auto.",
+                    "default": "auto",
+                },
+                "max_bytes": {"type": "integer", "description": "base64 only: refuse if the attachment exceeds this many bytes (default 10485760)", "default": 10485760},
+            },
+            "required": ["email_id", "attachment_id"],
+        },
+    ),
+    Tool(
         name="o365_search_files",
         description=(
             "Search files by name or content across the user's OneDrive AND every "
@@ -1014,6 +1086,7 @@ TOOL_PERMISSIONS: dict[str, PermissionLevel] = {
     "o365_get_file_content": PermissionLevel.READ_ONLY,
     "o365_peek_drive_file": PermissionLevel.READ_ONLY,
     "o365_peek_mail_attachment": PermissionLevel.READ_ONLY,
+    "o365_get_mail_attachment": PermissionLevel.READ_ONLY,
     "o365_search_files": PermissionLevel.READ_ONLY,
     "o365_search_sites": PermissionLevel.READ_ONLY,
     "o365_get_site_drives": PermissionLevel.READ_ONLY,
@@ -1496,16 +1569,26 @@ def _peek_result(
     from mcp.types import ImageContent
     from office_con.peek import peek_document
 
-    peek = peek_document(
-        content,
-        name=name,
-        content_type=content_type,
-        pages=args.get("pages", 1),
-        render=args.get("render", True),
-        max_rows=args.get("max_rows", 30),
-        max_paragraphs=args.get("max_paragraphs", 30),
-        all_sheets=args.get("all_sheets", False),
-    )
+    try:
+        peek = peek_document(
+            content,
+            name=name,
+            content_type=content_type,
+            pages=args.get("pages", 1),
+            render=args.get("render", True),
+            max_rows=args.get("max_rows", 30),
+            max_paragraphs=args.get("max_paragraphs", 30),
+            all_sheets=args.get("all_sheets", False),
+        )
+    except Exception as exc:
+        # A real mailbox holds corrupt, truncated, or password-protected files.
+        # Don't turn that into an opaque "tool failed" — return the metadata we
+        # do have plus the reason, so the agent can still act on it.
+        logger.warning("[MCP] peek_document failed for %s (%s): %s", name, content_type, exc)
+        peek = {
+            "kind": "unreadable",
+            "error": f"could not parse document: {exc}",
+        }
     peek.setdefault("name", name)
     peek.setdefault("content_type", content_type)
     peek["byte_size"] = len(content)
@@ -1532,6 +1615,60 @@ def _peek_result(
         peek["renders"] = compact_renders
 
     return [TextContent(type="text", text=json.dumps(peek, default=str, indent=2))] + images
+
+
+# Default ceiling for returning a mail attachment as inline base64. Graph caps
+# inline fileAttachments at ~3 MB anyway; 10 MB is a generous guard that still
+# stops a pathological attachment from blowing up the model context.
+_GET_ATTACHMENT_DEFAULT_MAX = 10 * 1024 * 1024
+
+
+async def _fetch_mail_attachment(graph, email_id: str, attachment_id: str):
+    """Fetch one mail attachment's raw bytes + Graph metadata, applying the same
+    existence and privacy gates as the peek tool.
+
+    Returns ``(content, meta, error)``: when ``error`` (a list of MCP content
+    blocks) is not None the caller must return it verbatim; otherwise ``content``
+    is the decoded ``bytes`` and ``meta`` is the attachment JSON (name,
+    contentType, size, …). The single-attachment GET is bounded by the same 60s
+    request timeout as every Graph call, so it never reintroduces the bulk
+    inline-download stall that get_mail had.
+    """
+    mail = await graph.get_mail().get_mail_async(
+        email_id=email_id, attachments=False, body_format="none",
+    )
+    if mail is None:
+        return None, None, [TextContent(type="text", text="Email not found.")]
+    if mail.access_status == "content_blocked":
+        return None, None, [TextContent(type="text", text=f"Access blocked by privacy settings: {mail.access_reason}")]
+    token = await graph.get_access_token_async()
+    url = f"{graph.msg_endpoint}me/messages/{email_id}/attachments/{attachment_id}"
+    resp = await graph.run_async(url=url, token=token)
+    if resp is None or resp.status_code != 200:
+        status = resp.status_code if resp else "no response"
+        return None, None, [TextContent(type="text", text=f"Attachment fetch failed: status={status}")]
+    att = resp.json()
+    cb = att.get("contentBytes")
+    if not cb:
+        return None, None, [TextContent(
+            type="text",
+            text=f"Attachment has no inline content (type={att.get('@odata.type')}). "
+                 f"May be an item attachment or reference attachment.",
+        )]
+    cfg = graph.privacy_settings.mail
+    if cfg.enabled:
+        if any_text_matches([att.get("name")], cfg.hidden_name_terms):
+            return None, None, [TextContent(type="text", text="Attachment not found.")]
+        if any_text_matches([att.get("name")], cfg.blocked_content_name_terms):
+            return None, None, [TextContent(type="text", text="Access blocked by privacy settings: Attachment content access is blocked.")]
+    content = base64.b64decode(cb)
+    if cfg.enabled:
+        text = decode_text_for_rules(content)
+        if text and any_text_matches([text], cfg.hidden_content_terms):
+            return None, None, [TextContent(type="text", text="Attachment not found.")]
+        if text and any_text_matches([text], cfg.blocked_content_terms):
+            return None, None, [TextContent(type="text", text="Access blocked by privacy settings: Attachment content access is blocked.")]
+    return content, att, None
 
 
 def _body_opts(args: dict) -> tuple[str, int | None]:
@@ -1569,6 +1706,7 @@ async def _handle_tool(
     show_room_booking_names: bool = False,
     attachment_roots: list[Path] | None = None,
     max_attachment_bytes: int = DEFAULT_MAX_ATTACHMENT_BYTES,
+    file_server: "LocalFileServer | None" = None,
 ) -> list[TextContent]:
     """Route a tool call to the appropriate handler."""
     if attachment_roots is None:
@@ -2141,50 +2279,86 @@ async def _handle_tool(
         )
 
     if name == "o365_peek_mail_attachment":
-        # Existence + privacy gate only; the attachment bytes are fetched by id
-        # below, so don't expand any attachments here (avoids the inline-download
-        # timeout that get_mail itself had).
-        mail = await graph.get_mail().get_mail_async(email_id=args["email_id"], attachments=False, body_format="none")
-        if mail is None:
-            return [TextContent(type="text", text="Email not found.")]
-        if mail.access_status == "content_blocked":
-            return [TextContent(type="text", text=f"Access blocked by privacy settings: {mail.access_reason}")]
-        token = await graph.get_access_token_async()
-        url = (
-            f"{graph.msg_endpoint}me/messages/{args['email_id']}"
-            f"/attachments/{args['attachment_id']}"
+        content, att, error = await _fetch_mail_attachment(
+            graph, args["email_id"], args["attachment_id"],
         )
-        resp = await graph.run_async(url=url, token=token)
-        if resp is None or resp.status_code != 200:
-            status = resp.status_code if resp else "no response"
-            return [TextContent(type="text", text=f"Attachment fetch failed: status={status}")]
-        att = resp.json()
-        cb = att.get("contentBytes")
-        if not cb:
-            return [TextContent(
-                type="text",
-                text=f"Attachment has no inline content (type={att.get('@odata.type')}). "
-                     f"May be an item attachment or reference attachment.",
-            )]
-        cfg = graph.privacy_settings.mail
-        if cfg.enabled:
-            if any_text_matches([att.get("name")], cfg.hidden_name_terms):
-                return [TextContent(type="text", text="Attachment not found.")]
-            if any_text_matches([att.get("name")], cfg.blocked_content_name_terms):
-                return [TextContent(type="text", text="Access blocked by privacy settings: Attachment content access is blocked.")]
-        content = base64.b64decode(cb)
-        if cfg.enabled:
-            text = decode_text_for_rules(content)
-            if text and any_text_matches([text], cfg.hidden_content_terms):
-                return [TextContent(type="text", text="Attachment not found.")]
-            if text and any_text_matches([text], cfg.blocked_content_terms):
-                return [TextContent(type="text", text="Access blocked by privacy settings: Attachment content access is blocked.")]
+        if error is not None:
+            return error
         return _peek_result(
             content, args,
             name=att.get("name"),
             content_type=att.get("contentType"),
             size_from_meta=att.get("size"),
         )
+
+    if name == "o365_get_mail_attachment":
+        delivery = (args.get("delivery") or "auto").lower()
+        content, att, error = await _fetch_mail_attachment(
+            graph, args["email_id"], args["attachment_id"],
+        )
+        if error is not None:
+            return error
+        meta = {
+            "name": att.get("name"),
+            "content_type": att.get("contentType"),
+            "size": att.get("size", len(content)),
+            "is_inline": att.get("isInline", False),
+        }
+        # Delivery resolution:
+        #   * auto  → URL when the file server is on (no payload in context), else base64.
+        #   * url   → URL; errors if the file server is off.
+        #   * base64→ inline bytes, capped by max_bytes (the real guardrail against a
+        #             context blowup). Honored even with the file server on, because a
+        #             network-isolated/sandboxed client on the same host CANNOT reach
+        #             the loopback URL — base64 (for small files) is its only path.
+        if delivery == "url" and file_server is None:
+            return [TextContent(
+                type="text",
+                text=("URL delivery requested but the local file server is not "
+                      "enabled. Start the MCP server with --file-server (or set "
+                      "OFFICE_CONNECT_FILE_SERVER=1), or use delivery='base64'."),
+            )]
+        if file_server is not None and delivery in ("auto", "url"):
+            published = file_server.publish(
+                content, name=att.get("name") or "attachment",
+                content_type=att.get("contentType") or "application/octet-stream",
+            )
+            return _json_result({
+                **meta,
+                "delivery": "url",
+                "url": published["url"],
+                "expires_in_seconds": published["expires_in"],
+                "hint": (
+                    "Fetch this loopback URL to get the original bytes (host-local, "
+                    "expires). If your fetcher is network-isolated and cannot reach "
+                    "127.0.0.1, call again with delivery='base64' (small files) "
+                    "instead. To re-attach to a draft, fetch the URL and pass the "
+                    "bytes (or save to an attachment root and attach by path)."
+                ),
+            })
+        # base64 delivery (explicit, or 'auto' with no file server). The max_bytes
+        # cap — not a blanket disable — is what prevents a context-bloating blob.
+        max_bytes = int(args.get("max_bytes", _GET_ATTACHMENT_DEFAULT_MAX))
+        if len(content) > max_bytes:
+            return [TextContent(
+                type="text",
+                text=(
+                    f"Attachment is {len(content)} bytes, over the {max_bytes}-byte "
+                    "limit for returning base64 inline (it would bloat the model "
+                    "context). Raise max_bytes, enable --file-server for a URL "
+                    "instead, or use o365_peek_mail_attachment for a preview."
+                ),
+            )]
+        return _json_result({
+            **meta,
+            "delivery": "base64",
+            "content_base64": base64.b64encode(content).decode("ascii"),
+            "hint": (
+                "Pass content_base64 (with name + content_type) to "
+                "o365_create_mail_draft / o365_update_mail_draft attachments to "
+                "re-attach this file to a new message."
+            ),
+        })
 
     if name == "o365_search_files":
         files = graph.get_files()
@@ -2375,6 +2549,7 @@ def create_server(
     permission_level: PermissionLevel | None = None,
     attachment_roots: list[Path] | None = None,
     max_attachment_bytes: int | None = None,
+    file_server: LocalFileServer | None = None,
 ) -> tuple[Server, str]:
     """Create the MCP server and return (server, keyfile) for deferred graph init.
 
@@ -2473,6 +2648,7 @@ def create_server(
                 graph, name, arguments,
                 attachment_roots=attachment_roots,
                 max_attachment_bytes=max_attachment_bytes,
+                file_server=file_server,
             )
         except AuthExpiredError as exc:
             logger.warning("[MCP] auth expired on tool %s: %s", name, exc)
@@ -2498,11 +2674,56 @@ def create_server(
 # ---------------------------------------------------------------------------
 
 
+FILE_SERVER_ENV = "OFFICE_CONNECT_FILE_SERVER"
+FILE_SERVER_PORT_ENV = "OFFICE_CONNECT_FILE_SERVER_PORT"
+FILE_SERVER_TTL_ENV = "OFFICE_CONNECT_FILE_SERVER_TTL"
+# Shared on-disk spool/port directory — all file-server processes that point at
+# the SAME dir share one listener (singleton). Default lives under the user
+# config dir (see LocalFileServer); override mainly for test isolation.
+FILE_SERVER_DIR_ENV = "OFFICE_CONNECT_FILE_SERVER_DIR"
+
+
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("[FILES] ignoring non-integer %s=%r", name, raw)
+        return default
+
+
+def _resolve_file_server(parsed) -> LocalFileServer | None:
+    """Build a (not-yet-started) LocalFileServer if enabled via flag/env, unless
+    we're in a hosted/server environment — there we never expose mailbox bytes
+    over HTTP, regardless of the flag (privacy; not overridable)."""
+    enabled = bool(getattr(parsed, "file_server", False)) or _env_truthy(FILE_SERVER_ENV)
+    if not enabled:
+        return None
+    if is_server_environment():
+        print(
+            "office-connect: --file-server ignored — server environment detected "
+            "(mailbox bytes are never exposed over HTTP on a hosted host).",
+            file=sys.stderr,
+        )
+        return None
+    port = parsed.file_server_port if parsed.file_server_port is not None else _env_int(FILE_SERVER_PORT_ENV, 0)
+    ttl = parsed.file_server_ttl if parsed.file_server_ttl is not None else _env_int(FILE_SERVER_TTL_ENV, 3600)
+    state_dir = os.environ.get(FILE_SERVER_DIR_ENV) or None
+    return LocalFileServer(port=port, ttl_seconds=ttl, state_dir=state_dir)
+
+
 async def main(
     keyfile: str,
     level: PermissionLevel,
     attachment_roots: list[Path],
     max_attachment_bytes: int,
+    file_server: LocalFileServer | None = None,
 ) -> None:
     """Run the MCP server over stdio."""
     mode = (
@@ -2513,14 +2734,22 @@ async def main(
         f"Office 365 MCP Server starting (permission: {level.value}; {mode})",
         file=sys.stderr,
     )
-    mcp, _ = create_server(
-        keyfile,
-        permission_level=level,
-        attachment_roots=attachment_roots,
-        max_attachment_bytes=max_attachment_bytes,
-    )
-    async with stdio_server() as (read_stream, write_stream):
-        await mcp.run(read_stream, write_stream, mcp.create_initialization_options())
+    if file_server is not None:
+        await file_server.start()
+        print(f"Local file server: {file_server.base_url} (loopback)", file=sys.stderr)
+    try:
+        mcp, _ = create_server(
+            keyfile,
+            permission_level=level,
+            attachment_roots=attachment_roots,
+            max_attachment_bytes=max_attachment_bytes,
+            file_server=file_server,
+        )
+        async with stdio_server() as (read_stream, write_stream):
+            await mcp.run(read_stream, write_stream, mcp.create_initialization_options())
+    finally:
+        if file_server is not None:
+            await file_server.stop()
 
 
 DEFAULT_KEYFILE = "~/.config/office-connect/token.json"
@@ -2676,8 +2905,38 @@ async def _verify_login_async(keyfile_path: str) -> dict | None:
     }
 
 
+def _device_code_login(msal_app, scopes: list[str]) -> dict:
+    flow = msal_app.initiate_device_flow(scopes=scopes)
+    if "user_code" not in flow:
+        err = flow.get("error_description") or flow.get("error") or flow
+        print(
+            "Error: failed to initiate device-code flow. The Azure AD app "
+            "registration usually needs 'Allow public client flows' enabled.\n"
+            f"  details: {err}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print(f"\n{flow['message']}\n", flush=True)
+    print("(If this page fails with AADSTS900561, your tenant likely blocks "
+          "device code — Ctrl-C and use `office-connect login --browser`.)", flush=True)
+    print("Waiting for sign-in… (Ctrl-C to cancel)", flush=True)
+
+    result = msal_app.acquire_token_by_device_flow(flow)
+    if "access_token" not in result:
+        err = result.get("error_description") or result.get("error") or result
+        print(
+            f"Error: device flow did not return a token:\n  {err}\n"
+            "Hint: if the tenant blocks device-code sign-in (e.g. the browser "
+            "shows AADSTS900561), retry with `office-connect login --browser`.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return result
+
+
 def _cli_login(argv: list[str]) -> None:
-    """Interactive OAuth login via device-code flow; writes/updates a keyfile.
+    """Interactive OAuth login (device code, or ``--browser``); writes/updates a keyfile.
 
     First run: pass --client-id/--tenant-id (and --client-secret if your app
     requires it). The credentials are persisted into the keyfile so subsequent
@@ -2732,7 +2991,32 @@ def _cli_login(argv: list[str]) -> None:
     parser.add_argument("--app", default=None,
                         help="App label written to the keyfile (default: keep "
                              "existing or 'office-connect').")
+    browser = parser.add_argument_group(
+        "browser sign-in",
+        "Use --browser when the tenant blocks the device-code flow. The redirect "
+        "URI (default https://localhost:8443/auth/callback) must be registered on "
+        "the Azure AD app under 'Mobile and desktop applications'.",
+    )
+    browser.add_argument("--browser", action="store_true",
+                         help="Sign in through the browser (authorization code + "
+                              "PKCE, local HTTPS callback) instead of device code.")
+    browser.add_argument("--redirect-host", default=DEFAULT_REDIRECT_HOST,
+                         help="Redirect host (default: %(default)s).")
+    browser.add_argument("--redirect-port", type=int, default=DEFAULT_REDIRECT_PORT,
+                         help="Local HTTPS callback port (default: %(default)s).")
+    browser.add_argument("--redirect-path", default=DEFAULT_REDIRECT_PATH,
+                         help="Redirect path (default: %(default)s).")
+    browser.add_argument("--cert-file", default=None,
+                         help="TLS cert for the callback listener (PEM). Default: "
+                              "cached/mkcert/self-signed under "
+                              f"{DEFAULT_TLS_DIR}.")
+    browser.add_argument("--key-file", default=None,
+                         help="TLS private key matching --cert-file (PEM).")
+    browser.add_argument("--no-open", action="store_true",
+                         help="Print the sign-in URL instead of opening a browser.")
     args = parser.parse_args(argv)
+    if bool(args.cert_file) != bool(args.key_file):
+        parser.error("--cert-file and --key-file must be given together")
 
     keyfile_path = Path(args.keyfile).expanduser()
     existing: dict = {}
@@ -2806,25 +3090,32 @@ def _cli_login(argv: list[str]) -> None:
     authority = f"https://login.microsoftonline.com/{tenant_id}"
     msal_app = PublicClientApplication(client_id, authority=authority)
 
-    flow = msal_app.initiate_device_flow(scopes=scopes)
-    if "user_code" not in flow:
-        err = flow.get("error_description") or flow.get("error") or flow
-        print(
-            "Error: failed to initiate device-code flow. The Azure AD app "
-            "registration usually needs 'Allow public client flows' enabled.\n"
-            f"  details: {err}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    print(f"\n{flow['message']}\n", flush=True)
-    print("Waiting for sign-in… (Ctrl-C to cancel)", flush=True)
-
-    result = msal_app.acquire_token_by_device_flow(flow)
-    if "access_token" not in result:
-        err = result.get("error_description") or result.get("error") or result
-        print(f"Error: device flow did not return a token:\n  {err}", file=sys.stderr)
-        sys.exit(1)
+    if args.browser:
+        try:
+            result = run_browser_login(
+                msal_app,
+                scopes,
+                host=args.redirect_host,
+                port=args.redirect_port,
+                path=args.redirect_path,
+                cert_file=args.cert_file,
+                key_file=args.key_file,
+                open_browser=not args.no_open,
+                login_hint=existing.get("email") or None,
+                echo=lambda m: print(m, flush=True),
+            )
+        except BrowserLoginError as exc:
+            redirect = build_redirect_uri(args.redirect_host, args.redirect_port,
+                                          args.redirect_path)
+            print(
+                f"Error: browser sign-in failed:\n  {exc}\n"
+                f"If Microsoft reports a redirect URI mismatch (AADSTS50011), register "
+                f"{redirect} on the app under 'Mobile and desktop applications'.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    else:
+        result = _device_code_login(msal_app, scopes)
 
     claims = result.get("id_token_claims") or {}
     email = (
@@ -2908,6 +3199,7 @@ office-connect — Microsoft 365 MCP server & token CLI
 
 Subcommands:
   office-connect login                 Sign in / re-auth via device code (zero args after first setup)
+  office-connect login --browser       Sign in via the browser (when the tenant blocks device code)
   office-connect import-token PATH     Install an externally-exported token at the canonical location
 
 Run the MCP server (used by Claude Desktop etc.):
@@ -2994,6 +3286,25 @@ def cli() -> None:
         default=None,
         help=f"Log level (DEBUG/INFO/WARNING/...). Default ${LOG_LEVEL_ENV} or INFO.",
     )
+    parser.add_argument(
+        "--file-server",
+        action="store_true",
+        default=False,
+        help=(
+            "Serve large attachment bytes over a loopback (127.0.0.1) HTTP "
+            "endpoint at an unguessable URL, so a local fetcher can pull them "
+            "instead of base64 in context. OFF by default; never starts in a "
+            f"server environment. Env: {FILE_SERVER_ENV}=1."
+        ),
+    )
+    parser.add_argument(
+        "--file-server-port", type=int, default=None,
+        help=f"Port for --file-server (default 0 = OS-assigned). Env: {FILE_SERVER_PORT_ENV}.",
+    )
+    parser.add_argument(
+        "--file-server-ttl", type=int, default=None,
+        help=f"Seconds a published URL stays valid (default 3600). Env: {FILE_SERVER_TTL_ENV}.",
+    )
     parsed = parser.parse_args()
     configure_logging(parsed.log_file, parsed.log_level)
     try:
@@ -3002,7 +3313,8 @@ def cli() -> None:
         max_bytes = _parse_max_attachment_bytes()
     except ValueError as exc:
         parser.error(str(exc))
-    asyncio.run(main(parsed.keyfile, level, roots, max_bytes))
+    file_server = _resolve_file_server(parsed)
+    asyncio.run(main(parsed.keyfile, level, roots, max_bytes, file_server=file_server))
 
 
 if __name__ == "__main__":

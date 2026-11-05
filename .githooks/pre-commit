@@ -1,0 +1,3 @@
+#!/bin/sh
+# Public repository: block internal names in staged content and file names (scripts/content_guard.py).
+exec python3 "$(git rev-parse --show-toplevel)/scripts/content_guard.py" --staged

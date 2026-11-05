@@ -35,6 +35,8 @@ class CalendarEvent(BaseModel):
     sensitivity: Optional[str] = Field(default=None, description="Sensitivity: normal, personal, private, confidential")
     show_as: Optional[str] = Field(default=None, description="Free/busy status: free, tentative, busy, oof, workingElsewhere, unknown")
     importance: Optional[str] = Field(default=None, description="Importance: low, normal, high")
+    is_cancelled: bool = Field(default=False, description="Whether the organizer cancelled the event")
+    categories: List[str] = Field(default_factory=list, description="Assigned category labels")
 
 
 class CalendarEventList(BaseModel):
@@ -95,7 +97,9 @@ class CalendarHandler:
             online_meeting_url=online_meeting_url,
             sensitivity=event.get('sensitivity'),
             show_as=event.get('showAs'),
-            importance=event.get('importance')
+            importance=event.get('importance'),
+            is_cancelled=bool(event.get('isCancelled', False)),
+            categories=event.get('categories') or [],
         )
 
     # ── async API ─────────────────────────────────────────────────────────
@@ -157,20 +161,23 @@ class CalendarHandler:
         params = {
             "startDateTime": start_date.isoformat(),
             "endDateTime": end_date.isoformat(),
-            "$top": str(limit),
+            "$top": str(min(limit, 250)),
             "$orderby": "start/dateTime",
-            "$select": "id,subject,bodyPreview,body,start,end,location,organizer,attendees,isAllDay,isOnlineMeeting,onlineMeeting,sensitivity,showAs,importance",
+            "$select": "id,subject,bodyPreview,body,start,end,location,organizer,attendees,isAllDay,isOnlineMeeting,onlineMeeting,sensitivity,showAs,importance,isCancelled,categories",
         }
         param_str = "&".join([f"{k}={v}" for k, v in params.items()])
         url = f"{url}?{param_str}"
 
-        response = await self.msg.run_async(url=url, token=access_token)
-        if response is None or response.status_code != 200:
-            return CalendarEventList()
-
-        data = response.json()
-        events_data = data.get('value', [])
-        events = [self.parse_event(event) for event in events_data]
+        # Follow @odata.nextLink — a year of calendar is far more than one page.
+        events: List[CalendarEvent] = []
+        while url and len(events) < limit:
+            response = await self.msg.run_async(url=url, token=access_token)
+            if response is None or response.status_code != 200:
+                break
+            data = response.json()
+            events += [self.parse_event(event) for event in data.get('value', [])]
+            url = data.get('@odata.nextLink')
+        events = events[:limit]
         return CalendarEventList(events=events, total_events=len(events))
 
     async def get_events_this_month_async(self, calendar_id: Optional[str] = None, limit: int = 50) -> CalendarEventList:

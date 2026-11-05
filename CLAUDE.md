@@ -65,6 +65,8 @@ The flow prints a microsoft.com/devicelogin URL and short code, blocks polling, 
 
 You can also pre-create the app-config file by hand (it's just `{"client_id": "...", "tenant_id": "...", "client_secret": "..."}`). All eight scope groups are requested by default; narrow with repeatable `--scope` (`profile`, `directory`, `mail`, `calendar`, `chat`, `teams`, `drive`, `tasks`). The Azure AD app must have **"Allow public client flows"** enabled in its manifest.
 
+**Browser sign-in (`login --browser`) for tenants that block device code.** Some tenants block the device-code flow; the code-entry page then fails with `AADSTS900561` and no sign-in log entry is written. `office-connect login --browser` runs the authorization-code + PKCE flow instead (`office_con/auth/browser_login.py`): MSAL builds the authorize URL, the browser opens it, and a short-lived HTTPS listener bound to loopback only (127.0.0.1 / ::1, non-loopback peers get 403) catches the redirect on `https://localhost:8443/auth/callback` (override with `--redirect-host/--redirect-port/--redirect-path`; `--no-open` just prints the URL). That URI must be registered on the Azure AD app under **Mobile and desktop applications** (public client, so no secret is needed to redeem the code). TLS: `--cert-file/--key-file`, else a cached cert in `~/.config/office-connect/tls/`, else `mkcert` (browser-trusted), else a self-signed cert (one-time browser warning). Port 8443 rather than 443 because macOS only lets unprivileged processes bind <1024 on the wildcard address, and the listener must stay on loopback. Tests: `tests/test_browser_login.py`.
+
 **Updating the keyfile from an externally-exported token.** Some host applications offer an admin "Export Token" endpoint. To install the exported JSON at the canonical location:
 
 ```bash
@@ -146,9 +148,70 @@ Use `export_keyfile()` from `mcp_server.py` to write with 0600 permissions.
 - **URL fields:** `graph_url` (API) and `outlook_url` (human-openable) are the clear names; `email_url` is kept as a deprecated alias of `graph_url`, `web_link` as the original of `outlook_url`.
 - **Body hygiene:** `get_mail_async(body_format="text"|"html"|"none", max_body_chars=…)`. `body_text` is always provided (HTML stripped via BeautifulSoup); over-limit bodies are cut with `body_truncated=True`. The MCP tools default to `body_format="text"`, `max_body_chars=50000` to avoid context blowups; the library default is no limit (back-compat).
 - **Batch:** `get_mails_async(ids, …)` pulls many messages in one Graph `$batch` (chunked at 20), preserving input order.
+- **Attachments:** `get_mail_async` lists attachment **metadata only** (`attachment_id`, `name`, `size`; no bytes) via a separate constant-size `/attachments?$select=…` call — inlining bytes via `$expand=attachments` previously timed out on large PDFs. `$select` must use base-type properties only (`contentId`/`contentBytes` are on the derived `fileAttachment` type; selecting them 400s the collection). MCP tools: `o365_peek_mail_attachment` (preview text+PNG, degrades to `unreadable` on a corrupt file) and `o365_get_mail_attachment` (full bytes as base64, or — with `--file-server` — an unguessable loopback URL; see `docs/file_server.md`).
 - **Folder scoping:** `folder=` (well-known name via `resolve_well_known_folder` — inbox/sent/deleteditems/junk/archive/… — or id) scopes list+search; `exclude_folders=` drops by parentFolderId (client-side, may return fewer than `limit`).
 - **Legacy EX-DN:** `_is_legacy_dn` detects X500/Exchange DNs; `resolve_legacy_addresses_async` best-effort resolves them to SMTP via a cached directory lookup by display name (silently keeps the DN if directory scope is absent). Recipient-level DNs are isolated into `MailAddress.legacy_dn`.
 - **Meeting requests:** `event_id` links an `eventMessageRequest` to its calendar event (fetched via `$expand=event` on get) — hand it to `o365_get_events`.
+
+### Public repository — no internal names (explicit rule)
+
+This repository is public. Organisation names, internal domains and hosts, colleague names,
+cost centres / internal orders, tenant ids and customer or card numbers must never appear — not
+in code, docs, tests, examples, file names or commit messages. Use neutral examples (`Jane Doe`,
+`example.com`). Enforced by `scripts/content_guard.py`: the blocked terms are stored only as
+salted SHA-256 hashes (`scripts/content_guard.sha256`, add entries with `--hash TERM
+[--substring]`, never plaintext), local extras go in `~/.config/office-connect/content-guard.txt`.
+
+- **Enable the hooks once per clone:** `git config core.hooksPath .githooks` (`pre-commit` checks
+  staged blobs + file names, `commit-msg` the message).
+- `tests/test_content_guard.py` scans the whole working tree, so CI and hook-less clones fail too.
+- The guard never prints the matched term, only `path:line` — its output may land in CI logs.
+
+### One interface for all apps (explicit rule)
+
+office-connect is THE Microsoft 365 interface for every app in the ecosystem. Apps never build
+Graph/Outlook/login URLs, never call `run_async` with their own URLs and never parse raw Graph
+JSON — they call handler methods and get Pydantic models. When an app needs something Graph can
+do but the library can't yet, it is added HERE (in the style of the existing handlers, with a
+test), not worked around in the app. Human-openable links come from Graph itself
+(`OfficeMail.outlook_url` / `web_link`, `DriveItem.web_url`), never from string templates.
+
+### Stateless — no local file storage (explicit rule)
+
+`MsGraphInstance`, `WebUserInstance` and every handler in `office_con/msgraph/` run on
+**stateless servers**: they must never read or write local files — no temp/staging
+dirs, no caches on disk, no token files. Tokens live in `cache_dict` (and the
+optional Redis session store); content goes in and out as `bytes` / Pydantic models
+(`OfficeMailAttachment.content_bytes`, `upload_file_by_path_async(content=…)`). Writing
+files is the CALLER's business (an app saving attachments, the CLI's keyfile via
+`export_keyfile()` in `mcp_server.py`). Keyfile loading therefore stays out of the
+handlers too.
+
+### Complete listings, drafts and drive writes
+
+- **Complete listings raise, lookups degrade.** Interactive lookups (`email_index_async`,
+  `search_items_async`, …) return an empty model on a non-200. Operations that promise
+  the FULL result — `OfficeMailHandler.list_messages_async` (paged `@odata.nextLink`,
+  filters `folder` / `received_since` / `has_attachments` / `subject_prefix`) and the
+  conditional drive writes — raise `GraphRequestError` (`office_con.msgraph.errors`)
+  instead: a rejected listing once looked exactly like "no mails with attachments".
+  Graph requires the `$orderby` property FIRST in `$filter` (else 400 `InefficientFilter`).
+- **Drafts:** `save_draft_async(...) -> OfficeDraft` (id, web_link, failed_attachments),
+  `patch_draft_async(id, body=/subject=/to_recipients=/cc_recipients=)` changes only the
+  given fields; `add_attachment_async` uses an upload session above 3 MB (inline POST 413s),
+  `list_attachments_async` / `clear_attachments_async` for re-attaching edited files.
+  `create_draft_async` / `update_draft_async` keep their dict return for the MCP tools.
+- **Calendar:** `get_events_async` follows `@odata.nextLink` up to `limit`; events carry
+  `is_cancelled` and `categories`.
+- **Drive by path** (relative to the user's OneDrive root): `get_item_by_path_async`,
+  `get_file_content_by_path_async -> (bytes, DriveItem)` (privacy checks applied),
+  `upload_file_by_path_async(path, content, if_match=e_tag | create_only=True)` —
+  optimistic concurrency, `DriveItemConflictError` on 409/412, upload session above 4 MB —
+  `create_folder_path_async`, `move_item_async`. There is deliberately **no delete
+  helper**: callers move obsolete items into a trash folder instead.
+- **Upload sessions:** `MsGraphInstance.upload_session_async(upload_url, content)` sends the
+  chunks (multiples of 320 KiB) WITHOUT the bearer token — the URL is pre-authenticated
+  and Graph rejects an Authorization header on it.
 
 ### MS Graph Timestamps
 
@@ -204,6 +267,24 @@ poetry run pytest tests/test_new_handlers.py -v
 ```
 
 Runs against synthetic mock data — covers all handlers (Presence, Tasks, People, Places, MailboxSettings, OnlineMeetings, etc.).
+
+### End-to-End MCP Tests (no credentials needed)
+
+`office_con.testing.mcp_client` is a small stdlib-only MCP client that spawns the
+real stdio server (`python -m office_con.mcp_server`) and drives it over JSON-RPC
+against mock data — no Office 365 credentials, no network. This exercises the
+full tool layer (registration, permission filtering, `call_tool` dispatch), which
+handler unit tests don't. Mock mode is requested by a `{"mock": true}` keyfile and
+triple-gated (`LLMING_MOCK_USERS=1` + `is_mock_enabled()` production block).
+
+```bash
+poetry run pytest tests/test_mcp_client_e2e.py -v
+# Poke tools by hand:
+python -m office_con.testing.mcp_client --mock list
+python -m office_con.testing.mcp_client --mock call o365_get_mail '{"email_id":"…"}'
+```
+
+Full guide: `docs/mcp_testing.md`.
 
 ### Integration Tests (real MS Graph)
 
