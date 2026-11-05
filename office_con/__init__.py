@@ -1,6 +1,6 @@
 """office-connect — Microsoft 365 superpowers for Python and AI agents."""
 
-__version__ = "0.1.8"
+__version__ = "0.1.9"
 
 from .web_user_instance import WebUserInstance
 from .db_user_instance import DBUserInstance

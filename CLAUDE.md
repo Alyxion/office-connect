@@ -162,9 +162,14 @@ in code, docs, tests, examples, file names or commit messages. Use neutral examp
 salted SHA-256 hashes (`scripts/content_guard.sha256`, add entries with `--hash TERM
 [--substring]`, never plaintext), local extras go in `~/.config/office-connect/content-guard.txt`.
 
-- **Enable the hooks once per clone:** `git config core.hooksPath .githooks` (`pre-commit` checks
-  staged blobs + file names, `commit-msg` the message).
-- `tests/test_content_guard.py` scans the whole working tree, so CI and hook-less clones fail too.
+- **Enable the hooks once per clone:** `git config core.hooksPath .githooks` — `pre-commit`
+  (staged blobs + file names), `commit-msg` (the message), `pre-push` (EVERY outgoing commit:
+  added lines, names, messages — catches `--no-verify` commits and merged branches).
+- `tests/test_content_guard.py` scans the working tree AND the whole history;
+  `.github/workflows/content-guard.yml` runs both on every push and PR (hook-less clones).
+- Letter-class obfuscation (`[Ab][Cd]…`) is decoded and checked — never "hide" a term that way.
+- A history leak is public until the history is rewritten (`git filter-repo --replace-text`,
+  force-push) AND GitHub Support purges the old SHAs; a leaked PyPI file must be deleted on PyPI.
 - The guard never prints the matched term, only `path:line` — its output may land in CI logs.
 
 ### One interface for all apps (explicit rule)
@@ -248,10 +253,13 @@ To cut a release:
    git commit -m "Bump version to X.Y.Z"
    git push origin main
    ```
-3. **Build artifacts and publish**:
+3. **Build, CHECK, then publish** — never upload an archive the content guard has not seen
+   (PyPI files are public and immutable; 0.1.7/0.1.8 once shipped internal names):
    ```bash
    rm -rf dist/
-   poetry publish --build
+   poetry build
+   python3 scripts/content_guard.py --archive dist/*
+   poetry publish
    ```
    `--build` produces both wheel + sdist into `dist/` and uploads them. The `readme`, `classifiers`, `keywords`, and `repository` fields from `pyproject.toml` populate the PyPI listing — keep those current.
 4. **Verify**: `curl -sS https://pypi.org/pypi/office-connect/json | jq .info.version` should report the new version within ~30s of upload (the JSON cache lags the simple index slightly).

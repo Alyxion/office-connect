@@ -46,3 +46,14 @@ def test_hash_list_contains_no_plaintext():
 
 def test_working_tree_is_clean():
     assert guard.check_files(guard.tree_items(), guard.load_rules()) == []
+
+
+def test_letter_class_obfuscation_is_decoded():
+    rules = _rules(substrings=["examplecorp"])
+    assert guard.scan('re.compile(r"[Ee][Xx][Aa][Mm][Pp][Ll][Ee][Cc][Oo][Rr][Pp]", re.I)', rules)
+    assert not guard.scan('re.compile(r"[0-9a-f]{8}-[A-Za-z]")', rules)
+
+
+def test_whole_history_is_clean():
+    """A leak in any commit stays public forever (until a rewrite) — the CI runs this too."""
+    assert guard.check_files(guard.range_items("--all"), guard.load_rules()) == []

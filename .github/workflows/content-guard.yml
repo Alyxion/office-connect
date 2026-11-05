@@ -1,0 +1,16 @@
+name: content-guard
+# This repository is public: no internal names in the tree or ANYWHERE in the history.
+on:
+  push:
+  pull_request:
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Working tree
+        run: python3 scripts/content_guard.py --tree
+      - name: Every commit (content, file names, messages)
+        run: python3 scripts/content_guard.py --history

@@ -1,0 +1,16 @@
+#!/bin/sh
+# Public repository: check EVERY commit about to be pushed (added lines, file names, messages) —
+# also catches commits made with --no-verify and merged branches (scripts/content_guard.py).
+guard="$(git rev-parse --show-toplevel)/scripts/content_guard.py"
+zero=0000000000000000000000000000000000000000
+while read -r local_ref local_sha remote_ref remote_sha; do
+    [ "$local_sha" = "$zero" ] && continue  # branch deletion
+    if [ "$remote_sha" = "$zero" ]; then
+        range="$local_sha --not --remotes"
+    else
+        range="$remote_sha..$local_sha"
+    fi
+    # shellcheck disable=SC2086
+    python3 "$guard" --range "$range" || exit 1
+done
+exit 0
